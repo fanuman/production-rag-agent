@@ -10,3 +10,5 @@ node_modules/
 .terraform/
 *.tfstate
 *.tfstate.backup
+chroma_db/
+data/*.pdf

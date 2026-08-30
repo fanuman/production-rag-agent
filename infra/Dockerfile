@@ -1,4 +1,3 @@
-# infra/Dockerfile
 FROM python:3.13-slim
 
 WORKDIR /app
@@ -7,6 +6,7 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 COPY src/ ./src/
+COPY chroma_db/ ./chroma_db/
 
 ENV PYTHONUNBUFFERED=1
 

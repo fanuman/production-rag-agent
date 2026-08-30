@@ -4,8 +4,11 @@ from dotenv import load_dotenv
 load_dotenv()
 
 from src.llm_client import ProductionLLMClient
+from src.rag import generate_answer
+from src.api.models import ChatRequest, ChatResponse, ChatMetaData, RagRequest, RagResponse
+
 from fastapi import FastAPI, HTTPException
-from src.api.models import ChatRequest, ChatResponse, ChatMetaData
+
 
 llm_client = None
 
@@ -44,3 +47,15 @@ def cost():
         total_retries=llm_client.total_retries,
         total_cost=llm_client.total_cost
     )
+
+@app.post("/ask", response_model=RagResponse)
+def ask(request: RagRequest):
+    try:
+        result = generate_answer(request.message)
+        return RagResponse(
+            reply=result["answer"],
+            sources=result["sources"],
+            used_fallback=result["used_fallback"]
+        )
+    except Exception as error:
+        raise HTTPException(status_code=502, detail=str(error))
