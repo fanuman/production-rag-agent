@@ -1,7 +1,6 @@
 # ingest.py
 import os
 import glob
-from pypdf import PdfReader
 from openai import OpenAI
 import chromadb
 from langchain_text_splitters import RecursiveCharacterTextSplitter
@@ -13,7 +12,7 @@ openai_client = OpenAI()
 chroma_client = chromadb.PersistentClient(path="./chroma_db")
 
 collection = chroma_client.get_or_create_collection(
-    name="ai_governance_docs",
+    name="trailpeak_docs",
     configuration={"hnsw": {"space": "cosine"}}
 )
 
@@ -21,37 +20,24 @@ def get_embedding(text, model="text-embedding-3-small"):
     response = openai_client.embeddings.create(input=text, model=model)
     return response.data[0].embedding
 
-def extract_text_from_pdf(pdf_path):
-    reader = PdfReader(pdf_path)
-    text = ""
-    for page in reader.pages:
-        page_text = page.extract_text()
-        if page_text:
-            text += page_text + "\n"
-    return text
-
 splitter = RecursiveCharacterTextSplitter(
     chunk_size=800,
     chunk_overlap=150,
     separators=["\n\n", "\n", ". ", " ", ""]
 )
 
-pdf_files = glob.glob("data/*.pdf")
-print(f"Found {len(pdf_files)} PDF(s): {pdf_files}")
+txt_files = glob.glob("data/*.txt")
+print(f"Found {len(txt_files)} document(s)")
 
 all_ids, all_chunks, all_metadatas = [], [], []
 chunk_counter = 0
 
-for pdf_path in pdf_files:
-    filename = os.path.basename(pdf_path)
-    print(f"Processing {filename}...")
+for txt_path in txt_files:
+    filename = os.path.basename(txt_path)
+    with open(txt_path, "r") as f:
+        text = f.read()
 
-    text = extract_text_from_pdf(pdf_path)
-    print(f"  Extracted {len(text):,} characters")
-
-    chunks = splitter.split_text(text)
-    print(f"  Split into {len(chunks)} chunks")
-
+    chunks = splitter.split_text(text)  # keep your existing splitter setup
     for chunk in chunks:
         all_ids.append(f"chunk_{chunk_counter}")
         all_chunks.append(chunk)

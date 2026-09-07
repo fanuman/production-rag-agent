@@ -1,0 +1,14 @@
+{
+  "TP-JKT-001": {"name": "StormShield Rain Jacket", "price": 189.00, "stock": 34, "sizes": ["XS", "S", "M", "L", "XL", "XXL"]},
+  "TP-TNT-002": {"name": "AlpinePeak 2-Person Tent", "price": 329.00, "stock": 12, "sizes": ["One Size"]},
+  "TP-PCK-003": {"name": "SummitCarry 65L Backpack", "price": 249.00, "stock": 0, "sizes": ["S/M", "M/L"]},
+  "TP-SLP-004": {"name": "CloudNine Sleeping Bag", "price": 219.00, "stock": 21, "sizes": ["Regular", "Long"]},
+  "TP-BOOT-005": {"name": "TrailBlazer Hiking Boots", "price": 159.00, "stock": 47, "sizes": ["8", "8.5", "9", "9.5", "10", "10.5", "11", "12"]},
+  "TP-POLE-006": {"name": "TrekLight Trekking Poles", "price": 89.00, "stock": 58, "sizes": ["One Size"]},
+  "TP-FILT-007": {"name": "HydroFlow Water Filter", "price": 39.00, "stock": 103, "sizes": ["One Size"]},
+  "TP-STOVE-008": {"name": "CampFire Portable Stove", "price": 44.00, "stock": 76, "sizes": ["One Size"]},
+  "TP-LAMP-009": {"name": "NightWatch Headlamp", "price": 34.00, "stock": 4, "sizes": ["One Size"]},
+  "TP-CLR-010": {"name": "BaseCamp Cooler", "price": 199.00, "stock": 15, "sizes": ["40L"]},
+  "TP-PWR-011": {"name": "SolarCharge Power Bank", "price": 59.00, "stock": 29, "sizes": ["One Size"]},
+  "TP-GLV-012": {"name": "FrostGuard Insulated Gloves", "price": 42.00, "stock": 0, "sizes": ["S", "M", "L", "XL"]}
+}

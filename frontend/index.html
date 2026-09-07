@@ -1,0 +1,74 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>TrailPeak Assistant</title>
+    <style>
+        body { font-family: sans-serif; max-width: 600px; margin: 40px auto; }
+        #chat { border: 1px solid #ccc; padding: 20px; min-height: 200px; white-space: pre-wrap; }
+        .sources { color: #666; font-size: 0.85em; margin-top: 4px; }
+        input { width: 80%; padding: 8px; }
+        button { padding: 8px 16px; }
+    </style>
+</head>
+<body>
+    <div id="chat"></div>
+    <input id="message" type="text" placeholder="Ask about our gear..." />
+    <button onclick="sendMessage()">Send</button>
+
+    <script>
+        async function sendMessage() {
+            const input = document.getElementById('message');
+            const button = document.querySelector('button');
+            const chat = document.getElementById('chat');
+            const message = input.value;
+            if (!message.trim()) return;
+            input.value = '';
+            chat.innerHTML += `\n\nYou: ${message}\nAssistant: `;
+
+            input.disabled = true;
+            button.disabled = true;
+            button.textContent = 'Thinking...';
+
+            try {
+                const response = await fetch('http://localhost:8000/ask/stream', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ message })
+                });
+
+                const reader = response.body.getReader();
+                const decoder = new TextDecoder();
+
+                while (true) {
+                    const { done, value } = await reader.read();
+                    if (done) break;
+                    const parts = decoder.decode(value).split('\n\n');
+
+                    for (const part of parts) {
+                        if (part.startsWith('event: sources')) {
+                            const dataLine = part.split('\n').find(l => l.startsWith('data: '));
+                            const sourcesList = JSON.parse(dataLine.slice(6));
+                            if (sourcesList.length > 0) {
+                                chat.innerHTML += `\n[Sources: ${sourcesList.join(', ')}]\n`;
+                            }
+                        } else if (part.startsWith('data: ')) {
+                            const content = part.slice(6);
+                            if (content === '[DONE]') continue;
+                            chat.innerHTML += content;
+                        }
+                    }
+                }
+            } finally {
+                input.disabled = false;
+                button.disabled = false;
+                button.textContent = 'Send';
+                input.focus();
+            }
+        }
+
+        document.getElementById('message').addEventListener('keydown', (e) => {
+            if (e.key === 'Enter') sendMessage();
+        });
+    </script>
+</body>
+</html>
