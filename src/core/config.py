@@ -1,0 +1,4 @@
+DEFAULT_MODEL = "gpt-4o-mini"
+EMBEDDING_MODEL = "text-embedding-3-small"
+RELEVANCE_THRESHOLD = 0.68
+RETRIEVAL_K = 5

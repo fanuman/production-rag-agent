@@ -1,7 +1,8 @@
 from dotenv import load_dotenv
 load_dotenv()
 
-from src.llm_client import ProductionLLMClient
+from src.core.llm_client import ProductionLLMClient
+
 
 def main():
     client = ProductionLLMClient()
@@ -19,6 +20,7 @@ def main():
         messages.append({"role": "assistant", "content": reply})
 
     client.report()
+
 
 if __name__ == "__main__":
     main()

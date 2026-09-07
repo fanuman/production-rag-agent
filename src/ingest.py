@@ -1,24 +1,14 @@
-# ingest.py
 import os
 import glob
-from openai import OpenAI
-import chromadb
-from langchain_text_splitters import RecursiveCharacterTextSplitter
 from dotenv import load_dotenv
 
 load_dotenv()
 
-openai_client = OpenAI()
-chroma_client = chromadb.PersistentClient(path="./chroma_db")
+from src.core.embeddings import get_embedding
+from src.core.vectorstore import get_collection
+from langchain_text_splitters import RecursiveCharacterTextSplitter
 
-collection = chroma_client.get_or_create_collection(
-    name="trailpeak_docs",
-    configuration={"hnsw": {"space": "cosine"}}
-)
-
-def get_embedding(text, model="text-embedding-3-small"):
-    response = openai_client.embeddings.create(input=text, model=model)
-    return response.data[0].embedding
+collection = get_collection()
 
 splitter = RecursiveCharacterTextSplitter(
     chunk_size=800,
@@ -37,7 +27,7 @@ for txt_path in txt_files:
     with open(txt_path, "r") as f:
         text = f.read()
 
-    chunks = splitter.split_text(text)  # keep your existing splitter setup
+    chunks = splitter.split_text(text)
     for chunk in chunks:
         all_ids.append(f"chunk_{chunk_counter}")
         all_chunks.append(chunk)

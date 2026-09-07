@@ -14,6 +14,7 @@ PRICING = {
     "gpt-4o-mini": {"input": 0.15, "output": 0.60},
 }
 
+
 class ProductionLLMClient:
     def __init__(self, model="gpt-4o-mini", max_retries=4, base_delay=1.0):
         api_key = os.getenv("OPENAI_API_KEY")

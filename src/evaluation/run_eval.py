@@ -1,6 +1,8 @@
-# src/run_eval.py
-from eval_metrics import faithfulness_score, answer_relevancy_score
-from src.rag import generate_answer
+from dotenv import load_dotenv
+load_dotenv()
+
+from src.evaluation.metrics import faithfulness_score, answer_relevancy_score
+from src.rag.pipeline import RAGPipeline
 
 golden_dataset = [
     "Is the SummitCarry backpack in stock, and what does it cost?",
@@ -10,13 +12,16 @@ golden_dataset = [
     "Can I return a water filter I already opened?",
 ]
 
+
 def run_eval():
+    pipeline = RAGPipeline()
     for q in golden_dataset:
-        result = generate_answer(q)
+        result = pipeline.answer(q)
         f_score, _ = faithfulness_score(result["answer"], result["full_context"])
         r_score = answer_relevancy_score(q, result["answer"])
         print(f"[{f_score:.2f} | {r_score.score}/5] {q}")
         print(f"   {result['answer'][:120]}...\n")
+
 
 if __name__ == "__main__":
     run_eval()
