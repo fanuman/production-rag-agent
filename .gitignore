@@ -12,3 +12,5 @@ node_modules/
 *.tfstate.backup
 chroma_db/
 data/
+lambda_package/
+*.zip

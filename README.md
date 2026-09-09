@@ -235,6 +235,14 @@ worth closing before Week 4's capstone:
   real tension — see commit history for the full reasoning), so it can occasionally include a
   retrieved-but-unused source.
 
+## Alternative deployment: AWS Lambda (serverless)
+
+`infra/lambda/lambda_app.py` demonstrates a serverless deployment of a scoped-down
+subset (/health, /chat only, no RAG) via Mangum + API Gateway. The full RAG pipeline
+isn't deployed this way yet - Lambda's package size limits and lack of persistent
+local disk make the locally-persisted Chroma index a poor fit without additional
+work (S3-backed loading, EFS, or migrating to a managed vector store like Pinecone).
+
 ## Milestones
 
 | Tag | Week | What it adds | Status |
