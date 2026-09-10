@@ -37,6 +37,7 @@ humanfriendly==10.0
 hyperframe==6.1.0
 idna==3.18
 importlib_resources==7.1.0
+iniconfig==2.3.0
 jiter==0.16.0
 jsonpatch==1.33
 jsonpointer==3.1.1
@@ -77,6 +78,7 @@ ormsgpack==1.12.2
 overrides==7.7.0
 packaging==26.3
 pinecone==9.1.0
+pluggy==1.6.0
 propcache==0.5.2
 protobuf==7.36.0
 pybase64==1.5.0
@@ -87,6 +89,7 @@ Pygments==2.21.0
 pypdf==6.16.2
 PyPika==0.51.1
 pyproject_hooks==1.2.0
+pytest==9.1.1
 python-dateutil==2.9.0.post0
 python-dotenv==1.2.3
 PyYAML==6.0.3
