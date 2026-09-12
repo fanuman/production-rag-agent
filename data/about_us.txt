@@ -1,0 +1,15 @@
+TRAILPEAK OUTDOORS - ABOUT US
+
+TrailPeak Outdoors is an online retailer specializing in outdoor and backpacking gear -
+tents, sleeping bags, hiking boots, trekking poles, and camping equipment for backpackers
+and weekend adventurers alike.
+
+This assistant can help with:
+- Product details and recommendations (e.g. "what tent works for winter camping?")
+- Current price and stock availability for any product
+- Shipping, returns, and warranty policy questions
+- Comparing products or calculating totals across multiple items
+
+If you ask what we sell, what this assistant can help with, or general questions about
+TrailPeak, we're an outdoor gear retailer and this assistant can answer product,
+availability, and policy questions for you.

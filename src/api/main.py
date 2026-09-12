@@ -1,7 +1,10 @@
 from contextlib import asynccontextmanager
-from dotenv import load_dotenv
 
+
+from dotenv import load_dotenv
 load_dotenv()
+from src.core.secrets import load_secret_into_env
+load_secret_into_env()
 
 from src.core.llm_client import ProductionLLMClient
 from src.rag.pipeline import RAGPipeline
