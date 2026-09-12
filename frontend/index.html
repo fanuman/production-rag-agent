@@ -1,74 +1,493 @@
 <!DOCTYPE html>
-<html>
+<html lang="en">
 <head>
-    <title>TrailPeak Assistant</title>
-    <style>
-        body { font-family: sans-serif; max-width: 600px; margin: 40px auto; }
-        #chat { border: 1px solid #ccc; padding: 20px; min-height: 200px; white-space: pre-wrap; }
-        .sources { color: #666; font-size: 0.85em; margin-top: 4px; }
-        input { width: 80%; padding: 8px; }
-        button { padding: 8px 16px; }
-    </style>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>TrailPeak Outdoors — Trail Guide</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Big+Shoulders+Display:wght@500;700&family=Inter:wght@400;500;600&display=swap" rel="stylesheet">
+<style>
+  :root {
+    --forest: #1B2E28;
+    --parchment: #EDE6D6;
+    --rust: #C1502E;
+    --rust-dark: #A23F22;
+    --stone: #6B6558;
+    --ink: #2A2620;
+    --paper: #F7F3E9;
+  }
+
+  * { box-sizing: border-box; }
+
+  body {
+    margin: 0;
+    font-family: 'Inter', -apple-system, sans-serif;
+    background: var(--parchment);
+    color: var(--ink);
+    display: flex;
+    justify-content: center;
+    min-height: 100vh;
+  }
+
+  .app {
+    width: 100%;
+    max-width: 640px;
+    min-height: 100vh;
+    display: flex;
+    flex-direction: column;
+    background: var(--paper);
+    box-shadow: 0 0 40px rgba(27, 46, 40, 0.08);
+  }
+
+  /* ---- Header: the one branded moment ---- */
+  header {
+    background: var(--forest);
+    color: var(--parchment);
+    padding: 22px 24px;
+    display: flex;
+    align-items: center;
+    gap: 14px;
+    flex-shrink: 0;
+  }
+
+  .peak-mark {
+    width: 34px;
+    height: 34px;
+    flex-shrink: 0;
+  }
+
+  .brand-text h1 {
+    font-family: 'Big Shoulders Display', sans-serif;
+    font-weight: 700;
+    font-size: 22px;
+    letter-spacing: 0.5px;
+    margin: 0;
+    line-height: 1;
+  }
+
+  .brand-text p {
+    margin: 4px 0 0;
+    font-size: 12.5px;
+    color: rgba(237, 230, 214, 0.65);
+    font-weight: 400;
+  }
+
+  /* ---- Chat area with subtle topo texture ---- */
+  #chat {
+    flex: 1;
+    overflow-y: auto;
+    padding: 20px 20px 8px;
+    background-color: var(--paper);
+    background-image:
+      radial-gradient(circle at 20% 20%, rgba(107,101,88,0.05) 0, transparent 40%),
+      radial-gradient(circle at 80% 60%, rgba(107,101,88,0.05) 0, transparent 45%),
+      repeating-radial-gradient(circle at 50% 0%, transparent 0, transparent 38px, rgba(107,101,88,0.045) 39px, rgba(107,101,88,0.045) 40px);
+    display: flex;
+    flex-direction: column;
+    gap: 16px;
+  }
+
+  /* ---- Empty state ---- */
+  .empty-state {
+    margin: auto 0;
+    text-align: center;
+    padding: 20px 10px;
+  }
+
+  .empty-state .peak-mark-lg {
+    width: 56px;
+    height: 56px;
+    margin: 0 auto 14px;
+    opacity: 0.55;
+  }
+
+  .empty-state h2 {
+    font-family: 'Big Shoulders Display', sans-serif;
+    font-size: 20px;
+    font-weight: 700;
+    color: var(--forest);
+    margin: 0 0 6px;
+    letter-spacing: 0.3px;
+  }
+
+  .empty-state p {
+    font-size: 14px;
+    color: var(--stone);
+    margin: 0 0 20px;
+  }
+
+  .suggestion-chips {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    max-width: 340px;
+    margin: 0 auto;
+  }
+
+  .chip {
+    background: var(--paper);
+    border: 1.5px solid rgba(107, 101, 88, 0.3);
+    color: var(--ink);
+    padding: 10px 16px;
+    border-radius: 8px;
+    font-size: 13.5px;
+    font-family: inherit;
+    cursor: pointer;
+    text-align: left;
+    transition: border-color 0.15s ease, background 0.15s ease;
+  }
+
+  .chip:hover {
+    border-color: var(--rust);
+    background: #fff;
+  }
+
+  /* ---- Messages ---- */
+  .msg-row {
+    display: flex;
+    gap: 10px;
+    align-items: flex-start;
+    animation: rise 0.25s ease;
+  }
+
+  @keyframes rise {
+    from { opacity: 0; transform: translateY(6px); }
+    to { opacity: 1; transform: translateY(0); }
+  }
+
+  .msg-row.user { flex-direction: row-reverse; }
+
+  .avatar {
+    width: 28px;
+    height: 28px;
+    border-radius: 6px;
+    flex-shrink: 0;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    margin-top: 2px;
+  }
+
+  .avatar.assistant { background: rgba(27, 46, 40, 0.08); }
+  .avatar.user { background: rgba(107, 101, 88, 0.15); }
+  .avatar svg { width: 16px; height: 16px; }
+
+  .bubble-col {
+    display: flex;
+    flex-direction: column;
+    max-width: 76%;
+  }
+
+  .msg-row.user .bubble-col { align-items: flex-end; }
+
+  .bubble {
+    padding: 11px 14px;
+    border-radius: 10px;
+    font-size: 14.5px;
+    line-height: 1.55;
+    word-wrap: break-word;
+  }
+
+  .msg-row.assistant .bubble {
+    background: #fff;
+    border-left: 3px solid var(--rust);
+    color: var(--ink);
+    border-radius: 4px 10px 10px 10px;
+  }
+
+  .msg-row.user .bubble {
+    background: var(--forest);
+    color: var(--parchment);
+    border-radius: 10px 4px 10px 10px;
+  }
+
+  .bubble p { margin: 0 0 8px; }
+  .bubble p:last-child { margin-bottom: 0; }
+  .bubble ul { margin: 4px 0 8px; padding-left: 18px; }
+  .bubble li { margin-bottom: 3px; }
+  .bubble strong { font-weight: 600; }
+
+  .sources-row {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+    margin-top: 6px;
+  }
+
+  .source-tag {
+    font-size: 10.5px;
+    color: var(--stone);
+    background: rgba(107, 101, 88, 0.1);
+    padding: 3px 8px;
+    border-radius: 100px;
+    font-family: 'Inter', sans-serif;
+  }
+
+  /* ---- Typing indicator ---- */
+  .typing-dots {
+    display: flex;
+    gap: 4px;
+    padding: 4px 2px;
+  }
+
+  .typing-dots span {
+    width: 6px;
+    height: 6px;
+    border-radius: 50%;
+    background: var(--stone);
+    opacity: 0.5;
+    animation: bounce 1.2s infinite ease-in-out;
+  }
+
+  .typing-dots span:nth-child(2) { animation-delay: 0.15s; }
+  .typing-dots span:nth-child(3) { animation-delay: 0.3s; }
+
+  @keyframes bounce {
+    0%, 60%, 100% { transform: translateY(0); opacity: 0.5; }
+    30% { transform: translateY(-4px); opacity: 1; }
+  }
+
+  /* ---- Input bar ---- */
+  .input-bar {
+    display: flex;
+    gap: 10px;
+    padding: 14px 20px 20px;
+    background: var(--paper);
+    border-top: 1px solid rgba(107, 101, 88, 0.15);
+    flex-shrink: 0;
+  }
+
+  #message {
+    flex: 1;
+    padding: 12px 14px;
+    border-radius: 8px;
+    border: 1.5px solid rgba(107, 101, 88, 0.3);
+    font-family: 'Inter', sans-serif;
+    font-size: 14.5px;
+    background: #fff;
+    color: var(--ink);
+    outline: none;
+    transition: border-color 0.15s ease;
+  }
+
+  #message:focus { border-color: var(--rust); }
+  #message:disabled { background: rgba(107, 101, 88, 0.08); color: var(--stone); }
+
+  #send-btn {
+    background: var(--rust);
+    color: #fff;
+    border: none;
+    border-radius: 8px;
+    padding: 0 20px;
+    font-family: 'Inter', sans-serif;
+    font-weight: 600;
+    font-size: 14px;
+    cursor: pointer;
+    transition: background 0.15s ease;
+    white-space: nowrap;
+  }
+
+  #send-btn:hover:not(:disabled) { background: var(--rust-dark); }
+  #send-btn:disabled { background: rgba(107, 101, 88, 0.3); cursor: not-allowed; }
+
+  #chat::-webkit-scrollbar { width: 6px; }
+  #chat::-webkit-scrollbar-thumb { background: rgba(107, 101, 88, 0.25); border-radius: 10px; }
+
+  @media (prefers-reduced-motion: reduce) {
+    .msg-row, .typing-dots span { animation: none !important; }
+  }
+</style>
 </head>
 <body>
-    <div id="chat"></div>
-    <input id="message" type="text" placeholder="Ask about our gear..." />
-    <button onclick="sendMessage()">Send</button>
 
-    <script>
-        async function sendMessage() {
-            const input = document.getElementById('message');
-            const button = document.querySelector('button');
-            const chat = document.getElementById('chat');
-            const message = input.value;
-            if (!message.trim()) return;
-            input.value = '';
-            chat.innerHTML += `\n\nYou: ${message}\nAssistant: `;
+<div class="app">
+  <header>
+    <svg class="peak-mark" viewBox="0 0 34 34" fill="none">
+      <path d="M4 26L14 10L19 18L23 12L30 26H4Z" stroke="#EDE6D6" stroke-width="2" stroke-linejoin="round" fill="none"/>
+    </svg>
+    <div class="brand-text">
+      <h1>TRAILPEAK OUTDOORS</h1>
+      <p>Trail Guide — ask about gear, stock, or policies</p>
+    </div>
+  </header>
 
-            input.disabled = true;
-            button.disabled = true;
-            button.textContent = 'Thinking...';
+  <div id="chat">
+    <div class="empty-state" id="empty-state">
+      <svg class="peak-mark-lg" viewBox="0 0 56 56" fill="none">
+        <path d="M6 42L23 16L31 29L38 19L50 42H6Z" stroke="#1B2E28" stroke-width="2" stroke-linejoin="round" fill="none"/>
+      </svg>
+      <h2>Where are you headed?</h2>
+      <p>Ask about products, stock, shipping, or returns.</p>
+      <div class="suggestion-chips">
+        <button class="chip" onclick="sendSuggestion(this)">What tent works for winter camping?</button>
+        <button class="chip" onclick="sendSuggestion(this)">Is the SummitCarry backpack in stock?</button>
+        <button class="chip" onclick="sendSuggestion(this)">What's your return policy?</button>
+      </div>
+    </div>
+  </div>
 
-            try {
-                const response = await fetch('http://localhost:8000/ask/stream', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ message })
-                });
+  <div class="input-bar">
+    <input id="message" type="text" placeholder="Ask the trail guide..." autocomplete="off" />
+    <button id="send-btn" onclick="sendMessage()">Send</button>
+  </div>
+</div>
 
-                const reader = response.body.getReader();
-                const decoder = new TextDecoder();
+<script>
+  // Update this to match wherever your API is currently deployed
+  // (currently pointed at localhost - swap to the EC2 IP when testing live)
+  const API_BASE = 'http://localhost:8000';
 
-                while (true) {
-                    const { done, value } = await reader.read();
-                    if (done) break;
-                    const parts = decoder.decode(value).split('\n\n');
+  let conversationStarted = false;
 
-                    for (const part of parts) {
-                        if (part.startsWith('event: sources')) {
-                            const dataLine = part.split('\n').find(l => l.startsWith('data: '));
-                            const sourcesList = JSON.parse(dataLine.slice(6));
-                            if (sourcesList.length > 0) {
-                                chat.innerHTML += `\n[Sources: ${sourcesList.join(', ')}]\n`;
-                            }
-                        } else if (part.startsWith('data: ')) {
-                            const content = part.slice(6);
-                            if (content === '[DONE]') continue;
-                            chat.innerHTML += content;
-                        }
-                    }
-                }
-            } finally {
-                input.disabled = false;
-                button.disabled = false;
-                button.textContent = 'Send';
-                input.focus();
+  const assistantIcon = `<svg viewBox="0 0 16 16" fill="none"><path d="M2 12L7 4L9 8L11 5L14 12H2Z" stroke="#1B2E28" stroke-width="1.3" stroke-linejoin="round"/></svg>`;
+  const userIcon = `<svg viewBox="0 0 16 16" fill="none"><circle cx="8" cy="5.5" r="2.5" stroke="#EDE6D6" stroke-width="1.3"/><path d="M3 14c0-3 2.5-5 5-5s5 2 5 5" stroke="#EDE6D6" stroke-width="1.3" stroke-linecap="round"/></svg>`;
+
+  // Lightweight markdown: bold, bullet lists, paragraph breaks. Content
+  // always comes from our own backend, not arbitrary user input, but text
+  // is still HTML-escaped first so any stray < or > never breaks layout.
+  function escapeHtml(str) {
+    return str.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+  }
+
+  function renderMarkdown(raw) {
+    let text = escapeHtml(raw);
+    text = text.replace(/\*\*(.+?)\*\*/g, "<strong>$1</strong>");
+
+    const lines = text.split("\n");
+    let html = "";
+    let inList = false;
+
+    for (const line of lines) {
+      const trimmed = line.trim();
+      if (/^[-*]\s+/.test(trimmed)) {
+        if (!inList) { html += "<ul>"; inList = true; }
+        html += `<li>${trimmed.replace(/^[-*]\s+/, "")}</li>`;
+      } else {
+        if (inList) { html += "</ul>"; inList = false; }
+        if (trimmed) html += `<p>${trimmed}</p>`;
+      }
+    }
+    if (inList) html += "</ul>";
+    return html || `<p></p>`;
+  }
+
+  function scrollToBottom() {
+    const chat = document.getElementById('chat');
+    chat.scrollTop = chat.scrollHeight;
+  }
+
+  function clearEmptyState() {
+    if (!conversationStarted) {
+      document.getElementById('empty-state').remove();
+      conversationStarted = true;
+    }
+  }
+
+  function addUserMessage(text) {
+    clearEmptyState();
+    const chat = document.getElementById('chat');
+    const row = document.createElement('div');
+    row.className = 'msg-row user';
+    row.innerHTML = `
+      <div class="avatar user">${userIcon}</div>
+      <div class="bubble-col"><div class="bubble">${escapeHtml(text)}</div></div>`;
+    chat.appendChild(row);
+    scrollToBottom();
+  }
+
+  function addAssistantPlaceholder() {
+    const chat = document.getElementById('chat');
+    const row = document.createElement('div');
+    row.className = 'msg-row assistant';
+    row.id = 'pending-assistant';
+    row.innerHTML = `
+      <div class="avatar assistant">${assistantIcon}</div>
+      <div class="bubble-col">
+        <div class="bubble"><div class="typing-dots"><span></span><span></span><span></span></div></div>
+      </div>`;
+    chat.appendChild(row);
+    scrollToBottom();
+    return row.querySelector('.bubble');
+  }
+
+  function sendSuggestion(btn) {
+    document.getElementById('message').value = btn.textContent;
+    sendMessage();
+  }
+
+  document.getElementById('message').addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') sendMessage();
+  });
+
+  async function sendMessage() {
+    const input = document.getElementById('message');
+    const button = document.getElementById('send-btn');
+    const text = input.value.trim();
+    if (!text) return;
+
+    input.value = '';
+    addUserMessage(text);
+    const bubble = addAssistantPlaceholder();
+
+    input.disabled = true;
+    button.disabled = true;
+    button.textContent = '...';
+
+    let sourcesList = [];
+    let assistantReply = '';
+    let firstToken = true;
+
+    try {
+      const response = await fetch(`${API_BASE}/ask/stream`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ message: text })
+      });
+
+      const reader = response.body.getReader();
+      const decoder = new TextDecoder();
+
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+
+        for (const part of decoder.decode(value).split('\n\n')) {
+          if (part.startsWith('event: sources')) {
+            const dataLine = part.split('\n').find(l => l.startsWith('data: '));
+            if (dataLine) sourcesList = JSON.parse(dataLine.slice(6));
+          } else if (part.startsWith('data: ')) {
+            const content = part.slice(6);
+            if (content === '[DONE]') continue;
+
+            if (firstToken) {
+              bubble.innerHTML = '';
+              firstToken = false;
             }
+            assistantReply += content;
+            bubble.innerHTML = renderMarkdown(assistantReply);
+            scrollToBottom();
+          }
         }
+      }
 
-        document.getElementById('message').addEventListener('keydown', (e) => {
-            if (e.key === 'Enter') sendMessage();
-        });
-    </script>
+      if (sourcesList.length > 0) {
+        const sourcesRow = document.createElement('div');
+        sourcesRow.className = 'sources-row';
+        sourcesRow.innerHTML = sourcesList.map(s => `<span class="source-tag">${escapeHtml(s)}</span>`).join('');
+        bubble.parentElement.appendChild(sourcesRow);
+      }
+
+    } catch (error) {
+      bubble.innerHTML = `<p>Something went wrong reaching the trail guide. Please try again.</p>`;
+    } finally {
+      input.disabled = false;
+      button.disabled = false;
+      button.textContent = 'Send';
+      input.focus();
+      scrollToBottom();
+    }
+  }
+</script>
+
 </body>
 </html>
