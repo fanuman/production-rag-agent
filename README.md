@@ -210,3 +210,70 @@ python -m src.evaluation.run_eval
 Deployed on a `t3.micro` EC2 instance — terminated between active use to avoid ongoing cost (see
 `ai-learning-journal`'s cleanup checklist). Redeploy via the steps in section 5 above; the image is
 always current in ECR via the CI/CD pipeline.
+
+
+## Quick redeploy (after terminating the EC2 instance)
+
+The instance is deliberately terminated between active use to avoid ongoing cost. Spinning it back
+up takes about 5 minutes:
+
+**1. Launch a new instance**
+- EC2 Console → Launch instance
+- Name: `production-rag-agent-server`
+- AMI: **Ubuntu Server** (24.04 or newer LTS)
+- Instance type: **t3.micro**
+- Key pair: **`prod-rag-pair`** (should still be listed — key pairs survive termination)
+- Security group: select the **existing** group from before, if it's still listed, rather than
+  rebuilding rules from scratch
+- **Advanced details → IAM instance profile**: select **`production-rag-agent-ec2-role`** —
+  this is the step that's easy to forget, and without it the app can't reach Secrets Manager
+
+**2. Update the security group for your current IP**
+Your IP likely changed since last time. Before connecting:
+```bash
+curl ifconfig.me
+```
+EC2 → Security Groups → the group attached to this instance → Edit inbound rules → update both
+the SSH (22) and Custom TCP (8000) rules to **"My IP"** (auto-detects the current one).
+
+**3. SSH in and install what's needed** (a fresh instance has nothing pre-installed)
+```bash
+ssh -i prod-rag-pair.pem ubuntu@<new-public-ip>
+sudo apt update
+sudo apt install -y docker.io awscli
+sudo usermod -aG docker $USER
+exit
+ssh -i prod-rag-pair.pem ubuntu@<new-public-ip>   # reconnect for the group change to apply
+```
+
+**4. Confirm the instance role is actually attached before pulling anything**
+```bash
+aws sts get-caller-identity
+```
+Should show `assumed-role/production-rag-agent-ec2-role/...` — if it shows an error instead, the
+IAM instance profile wasn't attached at launch; fix via EC2 → instance → Actions → Security →
+Modify IAM role.
+
+**5. Pull and run the latest image** (CI/CD keeps this current on every push to `main`)
+```bash
+aws ecr get-login-password --region eu-north-1 | docker login --username AWS --password-stdin <account-id>.dkr.ecr.eu-north-1.amazonaws.com
+docker pull <account-id>.dkr.ecr.eu-north-1.amazonaws.com/production-rag-agent:latest
+docker run -p 8000:8000 -d <account-id>.dkr.ecr.eu-north-1.amazonaws.com/production-rag-agent:latest
+```
+No `--env-file` needed — the instance role supplies the OpenAI key via Secrets Manager directly.
+
+**6. Verify it's actually working, not just running**
+```bash
+curl http://<new-public-ip>:8000/health
+curl -X POST http://<new-public-ip>:8000/ask \
+  -H "Content-Type: application/json" \
+  -d '{"message": "Is the SummitCarry backpack in stock, and what does it cost?"}'
+```
+Expect `$249.00, out of stock` — the known-good result used to verify every deployment this
+project.
+
+**7. If testing the frontend against this live instance**
+Update `API_BASE` in `frontend/index.html` from `http://localhost:8000` to
+`http://<new-public-ip>:8000`, then reopen the file in a browser.
+
+**8. When done — terminate again, not just stop**
