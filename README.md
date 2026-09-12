@@ -1,120 +1,90 @@
 # Production RAG Agent — TrailPeak Outdoors Assistant
 
 An agent-powered RAG chatbot, built incrementally over 4 weeks and deployed on AWS with CI/CD,
-logging/monitoring, and evaluation metrics.
+IAM-managed secrets, and monitoring.
 
-This repo isn't rewritten each week — it grows. Each Saturday's project builds directly on top of
-the last, and the git tags below let you see it evolve from a basic chatbot into a deployed,
-agent-powered production system. Check the tag history rather than just the latest commit to see
-that progression.
+This repo wasn't rewritten each week — it grew. Each Saturday's project built directly on the
+last: a containerized chatbot (Week 1) became a real RAG pipeline over a governance corpus (Week
+2), then pivoted domains and gained function calling (Week 3), then became a genuine multi-step
+agent deployed to real cloud infrastructure with a full CI/CD pipeline (Week 4). The git tags below
+trace that progression; check tag history, not just the latest commit, to see it.
 
-As of Week 3, this project answers questions for **TrailPeak Outdoors**, a fictional outdoor gear
-retailer — product details and store policies come from RAG over real documents, while current
-price and stock come from a live function-calling tool. Weeks 1–2 used a different corpus (AI
-governance/security documents); the underlying engineering carried over unchanged, only the
-subject matter and the documents changed.
+## Status: v1.0 — capstone complete
 
-## Status
-
-**Week 3 complete** — real-time SSE streaming frontend, a live function-calling tool combined
-with RAG retrieval, and a hand-built evaluation harness (faithfulness + answer relevancy) run
-against the live pipeline. See [Milestones](#milestones) below for what's next.
+The assistant answers questions for **TrailPeak Outdoors**, a fictional outdoor gear retailer.
+Product details and store policies come from RAG over real documents; current price and stock come
+from live function-calling tools; multi-step requests (checking several products, then totaling
+their cost) are handled by a genuine ReAct agent loop, not a single tool call. The app runs on EC2
+behind Docker, built and pushed automatically by GitHub Actions to ECR on every push, with its
+OpenAI API key supplied entirely by AWS Secrets Manager via an EC2 instance role — no access key or
+`.env` secret exists on the deployed server at all.
 
 ## Tech stack
 
-**Implemented so far:**
-- Python 3.13
-- FastAPI + uvicorn
+- Python 3.13, FastAPI + uvicorn
 - OpenAI API (`gpt-4o-mini`, `text-embedding-3-small`) — chat, structured output, function
-  calling, and streaming
-- Docker
+  calling, streaming
+- Docker, deployed on EC2
 - Chroma (vector store)
-- `langchain-text-splitters` (recursive chunking)
-- Server-Sent Events (SSE) for real-time token streaming to the browser
+- AWS: IAM (users + roles), EC2, S3, Secrets Manager, CloudWatch (logs + alarms), ECR
+- GitHub Actions (CI/CD: test → build → push to ECR)
 - A hand-built RAG evaluation harness (faithfulness + answer relevancy, LLM-as-judge)
-
-**Planned (upcoming weeks):**
-- AWS (Lambda/EC2, API Gateway, CloudWatch, Secrets Manager)
-- GitHub Actions (CI/CD)
-- LangGraph (multi-agent orchestration)
-- Hybrid search / re-ranking
-- Retry/cost-tracking protection extended to RAG calls (currently only `/chat` has it — a known,
-  flagged gap; see [Known gaps](#known-gaps) below)
+- A separate, scoped-down AWS Lambda + API Gateway deployment (Mangum), demonstrating a second
+  deployment model for `/health` + `/chat` only — see Known gaps below for why the full pipeline
+  isn't deployed this way
 
 ## Architecture
 
-The project is built around a shared core, a set of pluggable tools, and a `RAGPipeline` class
-that ties retrieval, tool use, and generation together — with three thin entrypoints (CLI, HTTP,
-streaming HTTP) on top.
-
 ```
-        cli.py              api/main.py (/chat, /ask, /ask/stream)
-     (terminal chat)          (FastAPI service)
-            \                       /
-             \                     /
-              core/llm_client.py (used by /chat only)
-              rag/pipeline.py -- RAGPipeline (used by /ask, /ask/stream)
-                     |                    \
-                     |                     \
-         core/embeddings.py          tools/inventory_tool.py
-         core/vectorstore.py          (CheckAvailability - live
-                     |                  price/stock, self-registers
-                     |                  with the pipeline)
-               Docker image
-           (runs any entrypoint)
+                    cli.py                  api/main.py (/chat, /ask, /ask/stream)
+                 (terminal chat)              (FastAPI service)
+                        \                          /
+                         \                        /
+                    core/llm_client.py (used by /chat only)
+                    core/secrets.py -- Secrets Manager fetch, .env fallback for local dev
+                    rag/pipeline.py -- RAGPipeline
+                               |                    \
+                               |                     \
+                   core/embeddings.py,          tools/inventory_tool.py (CheckAvailability)
+                   core/vectorstore.py          tools/calculator_tool.py (CalculateTotal)
+                               |                (both self-register with the pipeline)
+                         Docker image
+                    (built by GitHub Actions,
+                     pushed to ECR, pulled and
+                     run on EC2)
 
   data/*.txt --ingest.py--> chroma_db/ <-- RAGPipeline.retrieve()
-  (offline, one-time)      (persisted index)   (runtime, per-request)
+  (rebuilt from source        (persisted        (runtime, per-request)
+   on every CI run, not        in the image)
+   committed as a binary)
 
   evaluation/run_eval.py --> RAGPipeline.answer() --> evaluation/metrics.py
-  (offline, golden dataset)                            (faithfulness + relevancy scoring)
 ```
 
-**`core/`** — shared infrastructure with no domain logic: `config.py` (model names, relevance
-threshold, retrieval k — one source of truth instead of scattered hardcoded values),
-`embeddings.py` and `vectorstore.py` (single implementations, previously duplicated between
-ingestion and the RAG pipeline), and `llm_client.py` (`ProductionLLMClient` — exponential backoff
-retries, fail-fast on permanent/config errors, per-call cost tracking; currently used only by the
-plain `/chat` endpoint, not yet by RAG — see Known gaps).
+**`rag/pipeline.py`** — `RAGPipeline` runs a genuine ReAct loop (Day 16's pattern): the model can
+call `CheckAvailability` and `CalculateTotal` in sequence, with each step's input depending on the
+real output of the step before it (e.g., totaling two products' prices only after actually looking
+both up) — not a single round of tool calling. A `max_iterations` cap fails safely, reporting
+incompleteness honestly rather than guessing from partial steps if the loop can't converge.
 
-**`tools/`** — function-calling tools the RAG pipeline can invoke. `inventory_tool.py` defines
-`CheckAvailability` (live price/stock lookup by SKU) and self-registers its schema and handler, so
-the pipeline aggregates available tools rather than hand-assembling them — a new tool file
-following the same pattern is picked up automatically.
+**`core/secrets.py`** — fetches `OPENAI_API_KEY` from AWS Secrets Manager at startup via `boto3`,
+authenticating through whatever identity is already available (an EC2 instance role in
+production, `numan-dev`'s local AWS credentials in dev) — no access key is ever placed on a
+server. Falls back to `.env` (with a logged warning, not a silent swallow) if Secrets Manager is
+unreachable, so local development without AWS credentials configured still works.
 
-**`rag/`** — `pipeline.py` holds the `RAGPipeline` class: `retrieve()` (semantic search),
-`.answer()` (structured, self-audited final answer with real source attribution — the model
-reports which retrieved sources it actually used, not just which were retrieved), and
-`.answer_stream()` (the same retrieval and tool-decision logic, but streamed token-by-token via
-SSE). `prompts.py` holds the answer-generation prompt, which explicitly allows the model to reason
-across multiple retrieved chunks to reach a conclusion (e.g., inferring "no" from an explicit
-supported-list, rather than requiring the exact answer to appear verbatim) and explicitly directs
-price/stock questions to the `CheckAvailability` tool instead of the retrieved text.
+**`ingest.py`** — rebuilds the Chroma index from `data/*.txt` on every run (deletes and recreates
+the collection first, guaranteeing a clean rebuild rather than accumulating stale or colliding
+chunk IDs). Chunk IDs are content-derived hashes (filename + position), not a raw incrementing
+counter — fixes a real bug found this project where adding a new source document could silently
+shift and collide with existing chunk IDs. Run automatically as a CI step before every image build,
+so the deployed index is always provably derived from the current source documents, never a stale
+or manually-copied artifact.
 
-**`evaluation/`** — a hand-built RAG eval harness, not a third-party library, so every scoring
-mechanism is fully understood rather than treated as a black box. `metrics.py` implements
-**faithfulness** (does the answer only make claims supported by what the pipeline actually saw —
-retrieved chunks *and* tool output) and **answer relevancy** (does the answer address the
-question, independent of correctness), both via LLM-as-judge with structured output. `run_eval.py`
-runs a golden dataset through `RAGPipeline` and reports both scores per question.
-
-**`ingest.py`** — offline, one-time pipeline: reads source `.txt` documents, chunks them (800
-chars, 150 overlap), embeds each chunk, and stores them in a persisted Chroma collection tagged by
-source filename. Run manually whenever source documents change.
-
-**`api/main.py`** + **`api/models.py`** — the FastAPI service:
-- `GET /health` — liveness check
-- `POST /chat` — plain chatbot, no document grounding (Week 1)
-- `POST /ask` — RAG + tool-calling Q&A, with self-audited source attribution
-- `POST /ask/stream` — the same pipeline, streamed via SSE. Sends a named `sources` event first,
-  then streams answer tokens, then a `[DONE]` signal
-- `GET /cost` — running totals for calls, retries, and estimated spend (currently `/chat` only —
-  see Known gaps)
-
-**`frontend/index.html`** — a real browser chat UI using `fetch()` + a manual `ReadableStream`
-reader (not the browser's built-in `EventSource`, which can't send a POST body). Parses the named
-SSE `sources` event separately from the token stream, displays citations under each answer, and
-disables input while a response is streaming.
+**`.github/workflows/`** — a two-job pipeline: `test` (fast import-checks targeting real bugs
+found this project — missing `src.` prefixes, missing `global` declarations) gates
+`build-and-push` (rebuilds the vector index from source, builds the Docker image, pushes to ECR
+tagged by both commit SHA and `latest`).
 
 ## Project structure
 
@@ -127,9 +97,11 @@ production-rag-agent/
 │   │   ├── config.py
 │   │   ├── embeddings.py
 │   │   ├── vectorstore.py
-│   │   └── llm_client.py
+│   │   ├── llm_client.py
+│   │   └── secrets.py
 │   ├── tools/
 │   │   ├── inventory_tool.py
+│   │   ├── calculator_tool.py
 │   │   └── inventory.json
 │   ├── rag/
 │   │   ├── prompts.py
@@ -143,12 +115,15 @@ production-rag-agent/
 │       └── models.py
 ├── frontend/
 │   └── index.html
-├── data/                    # source .txt documents (not committed — see Setup)
-├── chroma_db/               # persisted vector index (not committed, shipped in the image)
 ├── infra/
-│   └── Dockerfile
+│   ├── Dockerfile
+│   └── lambda/
+│       └── lambda_app.py
+├── data/                    # original source documents - committed, not gitignored
+├── chroma_db/               # persisted index - gitignored, rebuilt from source every time
+├── .github/workflows/
 ├── requirements.txt
-└── .env                     # not committed — see Setup
+└── .env                     # local dev fallback only - not committed
 ```
 
 ## Setup and run
@@ -160,98 +135,78 @@ source venv/bin/activate
 pip install -r requirements.txt
 ```
 
-**2. Configure your API key**
+**2. Local config** — create `.env` in the repo root with `OPENAI_API_KEY=sk-...`. This is used
+directly for local development; in production, Secrets Manager takes over automatically.
 
-Create a `.env` file in the repo root:
-```
-OPENAI_API_KEY=sk-your-key-here
-```
-
-**3. Source documents**
-
-Place these in `data/` (not committed to git) — a product catalog and three store policies:
-`product_catalog.txt`, `shipping_policy.txt`, `returns_policy.txt`, `warranty_policy.txt`.
-Live inventory data (price/stock, not embedded — used by the `CheckAvailability` tool) lives at
-`src/tools/inventory.json`.
-
-**4. Run ingestion** (one-time, or whenever source documents change)
+**3. Run ingestion** (one-time, or whenever `data/*.txt` changes)
 ```bash
 python -m src.ingest
 ```
-Builds `chroma_db/` locally. Costs a fraction of a cent in embedding calls for this corpus size.
 
-**5a. Run the CLI locally**
-```bash
-python -m src.cli
-```
-
-**5b. Run the API locally**
+**4a. Run locally**
 ```bash
 uvicorn src.api.main:app --reload
 ```
-Interactive docs at `http://localhost:8000/docs`, or:
 ```bash
 curl -X POST http://localhost:8000/ask \
   -H "Content-Type: application/json" \
-  -d '{"message": "Is the SummitCarry backpack in stock, and what does it cost?"}'
+  -d '{"message": "How much would the StormShield jacket and TrekLight poles cost together?"}'
 ```
 
-**5c. Run the frontend**
-
-Open `frontend/index.html` directly in a browser while the API is running locally — it talks to
-`http://localhost:8000/ask/stream`.
-
-**6. Run the eval harness**
-```bash
-python -m src.evaluation.run_eval
-```
-Runs the golden dataset through the live pipeline and prints faithfulness + relevancy scores per
-question — an offline check, deliberately kept off the live request path (running eval inline on
-every user request would roughly double latency and cost for a number the user never asked for).
-
-**7. Run in Docker**
+**4b. Run via Docker**
 ```bash
 docker build -f infra/Dockerfile -t production-rag-agent .
 docker run --env-file .env -p 8000:8000 production-rag-agent
 ```
-Run as a CLI instead of the default API:
+
+**5. Deploy to EC2** (see `docs/` in commit history for the full walkthrough) — launch a `t3.micro`
+with the `production-rag-agent-ec2-role` instance profile attached (grants Secrets Manager read +
+ECR pull, nothing more), then on the instance:
 ```bash
-docker run --env-file .env -it production-rag-agent python -m src.cli
+aws ecr get-login-password --region eu-north-1 | docker login --username AWS --password-stdin <account-id>.dkr.ecr.eu-north-1.amazonaws.com
+docker pull <account-id>.dkr.ecr.eu-north-1.amazonaws.com/production-rag-agent:latest
+docker run -p 8000:8000 -d <account-id>.dkr.ecr.eu-north-1.amazonaws.com/production-rag-agent:latest
+```
+No `--env-file` needed here — the instance role supplies the OpenAI key via Secrets Manager
+directly.
+
+**6. Run the eval harness** (offline, deliberately not on the live request path)
+```bash
+python -m src.evaluation.run_eval
 ```
 
 ## Known gaps
 
-Flagged deliberately rather than fixed silently — real trade-offs made under time constraints,
-worth closing before Week 4's capstone:
-
-- **RAG calls have no retry protection.** `ProductionLLMClient`'s exponential backoff only wraps
-  `/chat`. `RAGPipeline` makes its own unwrapped `OpenAI()` calls — a transient network error
-  during `/ask` currently fails outright instead of retrying.
-- **`/cost` doesn't include RAG or tool-calling spend** — only tracks `/chat` usage, for the same
-  reason as above.
-- **The streaming endpoint's source list is less precise than the non-streaming one.** `/ask` uses
-  a second, self-audited LLM call to report only the sources actually used in the answer; `/ask/stream`
-  uses the simpler retrieved-sources list (streaming and a validated structured-output call are in
-  real tension — see commit history for the full reasoning), so it can occasionally include a
-  retrieved-but-unused source.
-
-## Alternative deployment: AWS Lambda (serverless)
-
-`infra/lambda/lambda_app.py` demonstrates a serverless deployment of a scoped-down
-subset (/health, /chat only, no RAG) via Mangum + API Gateway. The full RAG pipeline
-isn't deployed this way yet - Lambda's package size limits and lack of persistent
-local disk make the locally-persisted Chroma index a poor fit without additional
-work (S3-backed loading, EFS, or migrating to a managed vector store like Pinecone).
+- **The full RAG pipeline isn't deployed via Lambda.** `infra/lambda/lambda_app.py` demonstrates
+  serverless deployment for a scoped-down `/health` + `/chat` subset only — Lambda's package size
+  limits and lack of persistent local disk make the locally-persisted Chroma index a poor fit
+  without further work (S3-backed loading, EFS, or a managed vector store like Pinecone).
+- **EC2 has no CloudWatch monitoring wired up** the way the Lambda deployment does (Day 20's
+  alarm + structured logging were built against the Lambda function specifically, not the EC2
+  service) — a reasonable next step, not done here.
+- **A narrow retrieval edge case**: some natural phrasings of meta-questions ("what does your
+  company sell") don't score well enough against `about_us.txt` to beat the relevance threshold,
+  and confirmed that raising the threshold isn't a safe fix (a known-irrelevant query scored
+  better than a second genuine meta-question in testing) — the real fix is more naturally-phrased
+  content in `about_us.txt`, not a threshold change. Tracked in `ai-learning-journal`'s known
+  issues list.
+- **The streaming endpoint's source list is less precise** than the non-streaming one, for reasons
+  explained in-line in `rag/pipeline.py` (a validated structured-output pass and true token
+  streaming are in real tension).
+- **The frontend (`frontend/index.html`) is intentionally minimal** — functional, not polished.
+  A dedicated visual-design pass is planned as separate, future work outside this roadmap.
 
 ## Milestones
 
-| Tag | Week | What it adds | Status |
+| Tag | Week | What it added | Status |
 |-----|------|---------------|--------|
-| `v0.1-week1-chatbot` | 1 | Containerized CLI/API chatbot, production error handling, cost tracking | ✅ Done |
-| `v0.2-week2-rag` | 2 | RAG over a real multi-document corpus, source attribution | ✅ Done |
-| `v0.3-week3-frontend` | 3 | SSE streaming frontend, function calling + RAG, eval harness | ✅ Done |
-| `v1.0-capstone` | 4 | Agent-powered, deployed on AWS, CI/CD, monitored | ⬜ Upcoming |
+| `v0.1-week1-chatbot` | 1 | Containerized CLI/API chatbot, production error handling, cost tracking | ✅ |
+| `v0.2-week2-rag` | 2 | RAG over a real multi-document corpus, source attribution | ✅ |
+| `v0.3-week3-frontend` | 3 | SSE streaming frontend, function calling + RAG, eval harness | ✅ |
+| `v1.0-capstone` | 4 | Genuine multi-step agent, deployed on EC2 + ECR + CI/CD, Secrets Manager, IAM roles | ✅ |
 
 ## Live demo
 
-_(added once deployed — Week 4)_
+Deployed on a `t3.micro` EC2 instance — terminated between active use to avoid ongoing cost (see
+`ai-learning-journal`'s cleanup checklist). Redeploy via the steps in section 5 above; the image is
+always current in ECR via the CI/CD pipeline.
