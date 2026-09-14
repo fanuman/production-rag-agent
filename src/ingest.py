@@ -8,19 +8,14 @@ load_dotenv()
 
 import chromadb
 from src.core.embeddings import get_embedding
-from src.core.vectorstore import get_collection, CHROMA_PATH, COLLECTION_NAME
+from src.core.vectorstore import get_collection, delete_collection
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 
 # Delete any existing collection first - re-running ingestion should always
 # produce a clean, correctly-derived index from whatever's currently in
 # data/, not silently build on top of a collection whose chunk IDs may
 # have been assigned under a different (buggy) scheme.
-_client = chromadb.PersistentClient(path=CHROMA_PATH)
-try:
-    _client.delete_collection(name=COLLECTION_NAME)
-    print(f"Deleted existing '{COLLECTION_NAME}' collection - starting fresh")
-except Exception:
-    print(f"No existing '{COLLECTION_NAME}' collection found - creating new")
+delete_collection()
 
 collection = get_collection()
 
