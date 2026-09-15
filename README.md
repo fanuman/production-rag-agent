@@ -277,3 +277,9 @@ Update `API_BASE` in `frontend/index.html` from `http://localhost:8000` to
 `http://<new-public-ip>:8000`, then reopen the file in a browser.
 
 **8. When done — terminate again, not just stop**
+
+
+## Cleanup checklist (end of roadmap)
+
+- [x] ~~ECS service/cluster (Day 22)~~ - deleted same-day, 0 clusters confirmed
+- [ ] Lambda function `production-rag-chat` + its API Gateway HTTP API (Day 18)
