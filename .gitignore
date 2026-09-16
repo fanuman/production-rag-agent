@@ -13,3 +13,5 @@ node_modules/
 chroma_db/
 lambda_package/
 *.zip
+infra/terraform/.terraform/
+infra/terraform/terraform.tfstate*
