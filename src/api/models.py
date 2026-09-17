@@ -19,3 +19,4 @@ class RagResponse(BaseModel):
     reply: str
     sources: list[str]
     used_fallback: bool
+    from_cache: bool = False

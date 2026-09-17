@@ -67,7 +67,8 @@ def ask(request: RagRequest):
         return RagResponse(
             reply=result["answer"],
             sources=result["sources"],
-            used_fallback=result["used_fallback"]
+            used_fallback=result["used_fallback"],
+            from_cache=result["from_cache"],
         )
     except Exception as error:
         raise HTTPException(status_code=502, detail=str(error))

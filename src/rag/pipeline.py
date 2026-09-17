@@ -10,6 +10,7 @@ from src.core.vectorstore import get_collection
 from src.tools.inventory_tool import TOOL_SCHEMA as AVAILABILITY_SCHEMA, TOOL_FUNCTION as AVAILABILITY_FUNCTION
 from src.tools.calculator_tool import TOOL_SCHEMA as CALC_SCHEMA, TOOL_FUNCTION as CALC_FUNCTION
 from src.rag.prompts import build_answer_prompt, FINAL_ANSWER_INSTRUCTION
+from src.core.semantic_cache import SemanticCache
 
 
 class FinalAnswer(BaseModel):
@@ -27,15 +28,15 @@ class RAGPipeline:
         self.max_iterations = max_iterations
         self.tools = [AVAILABILITY_SCHEMA, CALC_SCHEMA]
         self.available_functions = {**AVAILABILITY_FUNCTION, **CALC_FUNCTION}
+        self.cache = SemanticCache()
         self.FALLBACK_MESSAGE =  (
             "Hi! I'm the TrailPeak Outdoors assistant. I can help with product details, "
             "current price and stock, shipping/returns/warranty questions, or comparing "
             "items and calculating totals. What are you looking for?"
         )
 
-    def retrieve(self, query, k=None):
+    def retrieve(self, query_embedding, k=None):
         k = k or self.k
-        query_embedding = get_embedding(query)
         results = self.collection.query(query_embeddings=[query_embedding], n_results=k)
         return results["documents"][0], [m["source"] for m in results["metadatas"][0]], results["distances"][0]
 
@@ -69,7 +70,20 @@ class RAGPipeline:
         return messages, tool_context_parts, True  # hit the cap without a final answer
 
     def answer(self, query, k=None):
-        chunks, sources, distances = self.retrieve(query, k=k)
+        query_embedding = get_embedding(query)
+
+        # Check if the response is already cached in Redis
+        cached = self.cache.check(query_embedding=query_embedding)
+        if cached:
+            return {
+                "answer": cached["response"],
+                "sources": [],
+                "used_fallback": False,
+                "full_context": cached["full_context"],
+                "from_cache": True
+            }
+
+        chunks, sources, distances = self.retrieve(query_embedding, k=k)
 
         if self._is_out_of_scope(distances):
             return {
@@ -77,6 +91,7 @@ class RAGPipeline:
                 "sources": [],
                 "used_fallback": True,
                 "full_context": "\n\n".join(chunks),
+                "from_cache": False
             }
 
         messages = [{"role": "user", "content": build_answer_prompt(query, chunks, sources)}]
@@ -90,17 +105,29 @@ class RAGPipeline:
             # Safe failure, same principle as Day 16 - report incompleteness
             # honestly rather than guess at an answer built from partial steps
             return {"answer": "I wasn't able to fully work through this request - it may need to be broken into simpler questions.",
-                    "sources": list(set(sources)), "used_fallback": True, "full_context": full_context}
+                    "sources": list(set(sources)), "used_fallback": True, "full_context": full_context, "from_cache": False}
 
         messages.append({"role": "user", "content": FINAL_ANSWER_INSTRUCTION})
         final = self.client.chat.completions.parse(model=self.model, messages=messages, response_format=FinalAnswer)
         parsed = final.choices[0].message.parsed
 
+        if not tool_context_parts and not hit_cap:
+            self.cache.store(query, parsed.answer, query_embedding, full_context)
+
         return {"answer": parsed.answer, "sources": parsed.sources_used,
-                "used_fallback": False, "full_context": full_context}
+                "used_fallback": False, "full_context": full_context, "from_cache": False}
 
     def answer_stream(self, query, k=None):
-        chunks, sources, distances = self.retrieve(query, k=k)
+        query_embedding = get_embedding(query)
+
+        cached = self.cache.check(query_embedding=query_embedding)
+        if cached:
+            yield f"event: sources\ndata: {json.dumps([])}\n\n"
+            yield f"data: {cached['response']}\n\n"
+            yield "data: [DONE]\n\n"
+            return
+
+        chunks, sources, distances = self.retrieve(query_embedding, k=k)
 
         if self._is_out_of_scope(distances):
             yield f"event: sources\ndata: {json.dumps([])}\n\n"
@@ -111,17 +138,27 @@ class RAGPipeline:
         yield f"event: sources\ndata: {json.dumps(list(set(sources)))}\n\n"
 
         messages = [{"role": "user", "content": build_answer_prompt(query, chunks, sources)}]
-        messages, _, hit_cap = self._run_agent_loop(messages)
+        messages, tool_context_parts, hit_cap = self._run_agent_loop(messages)
+
+        full_context = "\n\n".join(chunks)
+        if tool_context_parts:
+            full_context += "\n\n" + "\n\n".join(tool_context_parts)
 
         if hit_cap:
             yield "data: I wasn't able to fully work through this request - it may need to be broken into simpler questions.\n\n"
             yield "data: [DONE]\n\n"
             return
 
+        full_reply = ""
         stream = self.client.chat.completions.create(model=self.model, messages=messages, stream=True)
         for chunk in stream:
             if chunk.choices:
                 delta = chunk.choices[0].delta.content
                 if delta:
+                    full_reply += delta
                     yield f"data: {delta}\n\n"
+
+        if not tool_context_parts:
+            self.cache.store(query, full_reply, query_embedding, full_context)
+
         yield "data: [DONE]\n\n"

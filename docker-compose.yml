@@ -24,7 +24,7 @@ services:
     command: "run --host 0.0.0.0 --port 8001 --path /chroma/chroma"
 
   redis:
-    image: redis:7-alpine
+    image: redis/redis-stack-server:latest
     ports:
       - "6379:6379"
 
