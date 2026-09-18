@@ -14,6 +14,12 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 
+from slowapi import Limiter, _rate_limit_exceeded_handler
+from slowapi.util import get_remote_address
+from slowapi.errors import RateLimitExceeded
+from slowapi.middleware import SlowAPIMiddleware
+from fastapi import Request
+
 
 llm_client = None
 rag_pipeline = None
@@ -28,6 +34,11 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(lifespan=lifespan)
 
+limiter = Limiter(key_func=get_remote_address, storage_uri="redis://redis:6379/0")
+app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+
+app.add_middleware(SlowAPIMiddleware)
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
 
@@ -37,11 +48,12 @@ def health():
 
 
 @app.post("/chat", response_model=ChatResponse)
-def chat(request: ChatRequest):
+@limiter.limit("10/minute")
+def chat(request: Request, chat_request: ChatRequest):
     try:
         response = llm_client.chat([
             {"role": "system", "content": "You are a helpful assistant."},
-            {"role": "user", "content": request.message}
+            {"role": "user", "content": chat_request.message}
         ])
         return ChatResponse(
             reply=response.choices[0].message.content,
@@ -61,9 +73,10 @@ def cost():
 
 
 @app.post("/ask", response_model=RagResponse)
-def ask(request: RagRequest):
+@limiter.limit("10/minute")
+def ask(request: Request, rag_request: RagRequest):
     try:
-        result = rag_pipeline.answer(request.message)
+        result = rag_pipeline.answer(rag_request.message)
         return RagResponse(
             reply=result["answer"],
             sources=result["sources"],
@@ -75,5 +88,6 @@ def ask(request: RagRequest):
 
 
 @app.post("/ask/stream")
-def ask_stream(request: RagRequest):
-    return StreamingResponse(rag_pipeline.answer_stream(request.message), media_type="text/event-stream")
+@limiter.limit("10/minute")
+def ask_stream(request: Request, rag_request: RagRequest):
+    return StreamingResponse(rag_pipeline.answer_stream(rag_request.message), media_type="text/event-stream")
