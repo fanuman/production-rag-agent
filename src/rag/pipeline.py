@@ -21,7 +21,6 @@ class FinalAnswer(BaseModel):
 class RAGPipeline:
     def __init__(self, model=DEFAULT_MODEL, relevance_threshold=RELEVANCE_THRESHOLD, k=RETRIEVAL_K, max_iterations=6):
         self.client = OpenAI()
-        self.collection = get_collection()
         self.model = model
         self.relevance_threshold = relevance_threshold
         self.k = k
@@ -37,7 +36,8 @@ class RAGPipeline:
 
     def retrieve(self, query_embedding, k=None):
         k = k or self.k
-        results = self.collection.query(query_embeddings=[query_embedding], n_results=k)
+        collection = get_collection()  # fetched fresh, every single call
+        results = collection.query(query_embeddings=[query_embedding], n_results=k)
         return results["documents"][0], [m["source"] for m in results["metadatas"][0]], results["distances"][0]
 
     def _is_out_of_scope(self, distances):
