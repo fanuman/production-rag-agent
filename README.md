@@ -1,33 +1,44 @@
 # Production RAG Agent — TrailPeak Outdoors Assistant
 
-An agent-powered RAG chatbot, built incrementally over 4 weeks and deployed on AWS with CI/CD,
-IAM-managed secrets, and monitoring.
+An agent-powered RAG chatbot, built incrementally over 5 weeks and deployed on AWS with CI/CD,
+IAM-managed secrets, semantic caching, rate limiting, and infrastructure defined as code.
 
 This repo wasn't rewritten each week — it grew. Each Saturday's project built directly on the
 last: a containerized chatbot (Week 1) became a real RAG pipeline over a governance corpus (Week
 2), then pivoted domains and gained function calling (Week 3), then became a genuine multi-step
-agent deployed to real cloud infrastructure with a full CI/CD pipeline (Week 4). The git tags below
-trace that progression; check tag history, not just the latest commit, to see it.
+agent deployed to real cloud infrastructure with a full CI/CD pipeline (Week 4), then gained
+multi-container local dev, Redis-backed caching and rate limiting, and a Terraform-defined
+ECS/Fargate deployment replacing hand-clicked console setup (Week 5). The git tags below trace
+that progression; check tag history, not just the latest commit, to see it.
 
-## Status: v1.0 — capstone complete
+## Status: v1.1 — Week 5 infrastructure complete
 
 The assistant answers questions for **TrailPeak Outdoors**, a fictional outdoor gear retailer.
 Product details and store policies come from RAG over real documents; current price and stock come
 from live function-calling tools; multi-step requests (checking several products, then totaling
-their cost) are handled by a genuine ReAct agent loop, not a single tool call. The app runs on EC2
-behind Docker, built and pushed automatically by GitHub Actions to ECR on every push, with its
-OpenAI API key supplied entirely by AWS Secrets Manager via an EC2 instance role — no access key or
-`.env` secret exists on the deployed server at all.
+their cost) are handled by a genuine ReAct agent loop, not a single tool call. Repeated or
+paraphrased questions can be served from a Redis-backed semantic cache instead of re-running the
+full pipeline, and every expensive endpoint is rate-limited. The app is defined as three
+containers — `app`, `chroma`, `redis` — run together via Docker Compose locally and deployed to
+ECS/Fargate through Terraform, with the OpenAI API key supplied entirely by AWS Secrets Manager
+via an IAM task role — no access key or `.env` secret exists on the deployed infrastructure at all.
 
 ## Tech stack
 
 - Python 3.13, FastAPI + uvicorn
 - OpenAI API (`gpt-4o-mini`, `text-embedding-3-small`) — chat, structured output, function
   calling, streaming
-- Docker, deployed on EC2
-- Chroma (vector store)
-- AWS: IAM (users + roles), EC2, S3, Secrets Manager, CloudWatch (logs + alarms), ECR
+- Docker, Docker Compose (local multi-container dev: app + Chroma server + Redis)
+- Chroma (vector store), run as its own networked server, not embedded in the app
+- Redis (`redis-stack-server`, RediSearch) — semantic response caching, keyed by embedding
+  distance rather than exact query match
+- `slowapi` — Redis-backed rate limiting, correct across multiple app instances, not just a
+  single process
+- AWS: IAM (users + roles), EC2, S3, Secrets Manager, CloudWatch (logs + alarms), ECR, ECS/Fargate
+- Terraform — the primary infrastructure definition for ECS/Fargate: cluster, IAM roles, security
+  group, task definition, service, all as reviewable code rather than console clicks
 - GitHub Actions (CI/CD: test → build → push to ECR)
+- Locust — load testing, used to verify rate limiting and caching under real concurrent traffic
 - A hand-built RAG evaluation harness (faithfulness + answer relevancy, LLM-as-judge)
 - A separate, scoped-down AWS Lambda + API Gateway deployment (Mangum), demonstrating a second
   deployment model for `/health` + `/chat` only — see Known gaps below for why the full pipeline
@@ -37,26 +48,31 @@ OpenAI API key supplied entirely by AWS Secrets Manager via an EC2 instance role
 
 ```
                     cli.py                  api/main.py (/chat, /ask, /ask/stream)
-                 (terminal chat)              (FastAPI service)
+                 (terminal chat)              (FastAPI, rate-limited via slowapi)
                         \                          /
                          \                        /
                     core/llm_client.py (used by /chat only)
                     core/secrets.py -- Secrets Manager fetch, .env fallback for local dev
                     rag/pipeline.py -- RAGPipeline
-                               |                    \
-                               |                     \
-                   core/embeddings.py,          tools/inventory_tool.py (CheckAvailability)
-                   core/vectorstore.py          tools/calculator_tool.py (CalculateTotal)
-                               |                (both self-register with the pipeline)
-                         Docker image
-                    (built by GitHub Actions,
-                     pushed to ECR, pulled and
-                     run on EC2)
+                               |         |          \
+                               |         |           \
+                   core/embeddings.py  core/       tools/inventory_tool.py (CheckAvailability)
+                   core/vectorstore.py semantic_   tools/calculator_tool.py (CalculateTotal)
+                        |              cache.py    (both self-register with the pipeline)
+                        |              (Redis,
+                        |               tool-using/failed
+                        |               answers never cached)
+                        |
+                  Chroma (own container,          Redis (own container,
+                  networked, not embedded)         RediSearch + rate-limit counters)
+
+  Three containers - app, chroma, redis - defined once in docker-compose.yml (local dev)
+  and once in infra/terraform/ecs.tf (ECS/Fargate). Same shape, two environments.
 
   data/*.txt --ingest.py--> chroma_db/ <-- RAGPipeline.retrieve()
-  (rebuilt from source        (persisted        (runtime, per-request)
-   on every CI run, not        in the image)
-   committed as a binary)
+  (run manually, post-deploy,        (a fresh collection reference is
+   against whichever Chroma           fetched on every call - not
+   is currently live)                 cached at startup)
 
   evaluation/run_eval.py --> RAGPipeline.answer() --> evaluation/metrics.py
 ```
@@ -67,24 +83,35 @@ real output of the step before it (e.g., totaling two products' prices only afte
 both up) — not a single round of tool calling. A `max_iterations` cap fails safely, reporting
 incompleteness honestly rather than guessing from partial steps if the loop can't converge.
 
+**`core/semantic_cache.py`** — `SemanticCache` checks whether an incoming query is close enough
+(cosine distance over its embedding) to a previously answered query to reuse that answer instead
+of re-running retrieval and generation. Deliberately never caches an answer that used a tool
+(live price/stock data would go stale) or a fallback/incomplete answer (a cached failure would
+become a *recurring* failure for the cache's TTL). `REDIS_HOST` is read from the environment,
+defaulting to Compose's `"redis"` DNS name locally; ECS's task definition overrides it to
+`"localhost"`, since containers within one Fargate task share a network interface rather than
+getting individual service DNS names the way Compose provides.
+
+**`retrieve()` fetches its Chroma collection fresh on every call**, not once at pipeline
+construction — a deliberate fix, not an oversight. Caching the collection reference at startup
+could be worked around on Docker Compose (restart the `app` container alone, `chroma`'s data
+survives), but has no equivalent on ECS: any task replacement is a wholly new task with an empty
+Chroma, so the old restart-based workaround would loop the same failure indefinitely there.
+
 **`core/secrets.py`** — fetches `OPENAI_API_KEY` from AWS Secrets Manager at startup via `boto3`,
-authenticating through whatever identity is already available (an EC2 instance role in
-production, `numan-dev`'s local AWS credentials in dev) — no access key is ever placed on a
-server. Falls back to `.env` (with a logged warning, not a silent swallow) if Secrets Manager is
-unreachable, so local development without AWS credentials configured still works.
+authenticating through whatever identity is already available (an IAM role in production,
+`numan-dev`'s local AWS credentials in dev) — no access key is ever placed on a server. Falls back
+to `.env` (with a logged warning, not a silent swallow) if Secrets Manager is unreachable, so
+local development without AWS credentials configured still works.
 
-**`ingest.py`** — rebuilds the Chroma index from `data/*.txt` on every run (deletes and recreates
-the collection first, guaranteeing a clean rebuild rather than accumulating stale or colliding
-chunk IDs). Chunk IDs are content-derived hashes (filename + position), not a raw incrementing
-counter — fixes a real bug found this project where adding a new source document could silently
-shift and collide with existing chunk IDs. Run automatically as a CI step before every image build,
-so the deployed index is always provably derived from the current source documents, never a stale
-or manually-copied artifact.
+**`ingest.py`** — deletes and recreates the Chroma collection from `data/*.txt` on every run,
+guaranteeing a clean rebuild rather than accumulating stale or colliding chunk IDs. Chunk IDs are
+content-derived hashes (filename + position), not a raw incrementing counter. Run manually,
+post-deployment, against whichever Chroma instance is currently live — no longer a CI step (see
+Known gaps for why that changed).
 
-**`.github/workflows/`** — a two-job pipeline: `test` (fast import-checks targeting real bugs
-found this project — missing `src.` prefixes, missing `global` declarations) gates
-`build-and-push` (rebuilds the vector index from source, builds the Docker image, pushes to ECR
-tagged by both commit SHA and `latest`).
+**`.github/workflows/`** — a two-job pipeline: `test` (fast import-checks) gates `build-and-push`
+(builds the Docker image, pushes to ECR tagged by both commit SHA and `latest`).
 
 ## Project structure
 
@@ -98,7 +125,8 @@ production-rag-agent/
 │   │   ├── embeddings.py
 │   │   ├── vectorstore.py
 │   │   ├── llm_client.py
-│   │   └── secrets.py
+│   │   ├── secrets.py
+│   │   └── semantic_cache.py
 │   ├── tools/
 │   │   ├── inventory_tool.py
 │   │   ├── calculator_tool.py
@@ -117,10 +145,19 @@ production-rag-agent/
 │   └── index.html
 ├── infra/
 │   ├── Dockerfile
-│   └── lambda/
-│       └── lambda_app.py
+│   ├── lambda/
+│   │   └── lambda_app.py
+│   └── terraform/
+│       ├── providers.tf
+│       ├── data.tf
+│       ├── iam.tf
+│       ├── variables.tf
+│       ├── ecs.tf
+│       └── terraform.tfvars    # gitignored - personal IP, not committed
 ├── data/                    # original source documents - committed, not gitignored
 ├── chroma_db/               # persisted index - gitignored, rebuilt from source every time
+├── docker-compose.yml
+├── locustfile.py
 ├── .github/workflows/
 ├── requirements.txt
 └── .env                     # local dev fallback only - not committed
@@ -138,14 +175,13 @@ pip install -r requirements.txt
 **2. Local config** — create `.env` in the repo root with `OPENAI_API_KEY=sk-...`. This is used
 directly for local development; in production, Secrets Manager takes over automatically.
 
-**3. Run ingestion** (one-time, or whenever `data/*.txt` changes)
+**3. Run locally via Docker Compose** (recommended — matches the deployed three-container shape)
 ```bash
-python -m src.ingest
+docker compose up --build
 ```
-
-**4a. Run locally**
+Then, in a separate terminal, ingest into the running stack:
 ```bash
-uvicorn src.api.main:app --reload
+CHROMA_HOST=localhost CHROMA_PORT=8001 python -m src.ingest
 ```
 ```bash
 curl -X POST http://localhost:8000/ask \
@@ -153,48 +189,82 @@ curl -X POST http://localhost:8000/ask \
   -d '{"message": "How much would the StormShield jacket and TrekLight poles cost together?"}'
 ```
 
-**4b. Run via Docker**
+**4. Run without Compose** (Chroma/Redis run separately, or point at a remote instance)
 ```bash
-docker build -f infra/Dockerfile -t production-rag-agent .
-docker run --env-file .env -p 8000:8000 production-rag-agent
+uvicorn src.api.main:app --reload
 ```
 
-**5. Deploy to EC2** (see `docs/` in commit history for the full walkthrough) — launch a `t3.micro`
-with the `production-rag-agent-ec2-role` instance profile attached (grants Secrets Manager read +
-ECR pull, nothing more), then on the instance:
-```bash
-aws ecr get-login-password --region eu-north-1 | docker login --username AWS --password-stdin <account-id>.dkr.ecr.eu-north-1.amazonaws.com
-docker pull <account-id>.dkr.ecr.eu-north-1.amazonaws.com/production-rag-agent:latest
-docker run -p 8000:8000 -d <account-id>.dkr.ecr.eu-north-1.amazonaws.com/production-rag-agent:latest
-```
-No `--env-file` needed here — the instance role supplies the OpenAI key via Secrets Manager
-directly.
+**5. Deploy to ECS/Fargate via Terraform (current, recommended deployment path)**
 
-**6. Run the eval harness** (offline, deliberately not on the live request path)
+```bash
+cd infra/terraform
+echo 'my_ip = "YOUR_IP/32"' > terraform.tfvars   # curl ifconfig.me for the value
+terraform init
+terraform plan    # read this before applying - it's cheap insurance
+terraform apply
+```
+
+Registers a three-container task (`app`, `chroma`, `redis`), a cluster, IAM roles, a security
+group, and a CloudWatch log group. Get the running task's public IP:
+```bash
+aws ecs list-tasks --cluster production-rag-agent-tf-cluster --query 'taskArns[0]' --output text
+aws ecs describe-tasks --cluster production-rag-agent-tf-cluster --tasks <task-arn> --query 'tasks[0].attachments[0].details' --output table
+aws ec2 describe-network-interfaces --network-interface-ids <eni-id> --query 'NetworkInterfaces[0].Association.PublicIp' --output text
+```
+Then ingest once against the fresh (empty) Chroma:
+```bash
+CHROMA_HOST=<task-ip> CHROMA_PORT=8001 python -m src.ingest
+```
+**Every task replacement means a brand-new, empty Chroma** — ingestion is a required step after
+every `terraform apply` that touches the task definition, or after
+`aws ecs update-service --force-new-deployment`, not a one-time setup step.
+
+**When done:** `terraform destroy` — tears down every resource Terraform created, in the correct
+dependency order, in one command. No manual cleanup checklist needed for anything defined here.
+
+**Alternate path — manual EC2 deployment (kept for reference, not actively maintained)**
+
+The original Month 1 deployment model, predating Redis/Compose. See "Quick redeploy (EC2)" below
+for the full walkthrough. Would need updating to match the current three-container setup if used
+going forward — the current, actively-maintained deployment path is Terraform/ECS above.
+
+**6. Load test** (against a local Compose stack, not live AWS infrastructure)
+```bash
+locust -f locustfile.py --host=http://localhost:8000
+```
+Opens a web UI at `localhost:8089`.
+
+**7. Run the eval harness** (offline, deliberately not on the live request path)
 ```bash
 python -m src.evaluation.run_eval
 ```
 
 ## Known gaps
 
+- **Chroma has no persistent storage in the ECS deployment.** Task replacement (a redeploy, a
+  forced restart) always starts with an empty Chroma, requiring manual re-ingestion every time. A
+  real fix — EFS-backed storage, or a managed vector store — is future work, not done here.
 - **The full RAG pipeline isn't deployed via Lambda.** `infra/lambda/lambda_app.py` demonstrates
   serverless deployment for a scoped-down `/health` + `/chat` subset only — Lambda's package size
   limits and lack of persistent local disk make the locally-persisted Chroma index a poor fit
-  without further work (S3-backed loading, EFS, or a managed vector store like Pinecone).
-- **EC2 has no CloudWatch monitoring wired up** the way the Lambda deployment does (Day 20's
-  alarm + structured logging were built against the Lambda function specifically, not the EC2
-  service) — a reasonable next step, not done here.
+  without further work.
+- **The EC2 deployment path predates Redis/Compose and is not actively maintained** — the current,
+  actively-used deployment model is the Terraform/ECS path above.
+- **`terraform.tfvars` (the real IP value) is per-person and gitignored** — anyone else running
+  this Terraform config needs to supply their own before `apply` will work.
 - **A narrow retrieval edge case**: some natural phrasings of meta-questions ("what does your
   company sell") don't score well enough against `about_us.txt` to beat the relevance threshold,
-  and confirmed that raising the threshold isn't a safe fix (a known-irrelevant query scored
-  better than a second genuine meta-question in testing) — the real fix is more naturally-phrased
-  content in `about_us.txt`, not a threshold change. Tracked in `ai-learning-journal`'s known
-  issues list.
-- **The streaming endpoint's source list is less precise** than the non-streaming one, for reasons
-  explained in-line in `rag/pipeline.py` (a validated structured-output pass and true token
-  streaming are in real tension).
-- **The frontend (`frontend/index.html`) is intentionally minimal** — functional, not polished.
-  A dedicated visual-design pass is planned as separate, future work outside this roadmap.
+  and raising the threshold isn't a safe fix (a known-irrelevant query scored better than a second
+  genuine meta-question in testing) — the real fix is more naturally-phrased content in
+  `about_us.txt`, not a threshold change.
+- **The semantic cache is deliberately conservative** — real testing found that paraphrased
+  questions can score *farther apart* in embedding distance than genuinely different questions on
+  adjacent topics, so the threshold favors missing some real cache hits over ever risking a wrong
+  cached answer.
+- **The streaming endpoint's source list is less precise** than the non-streaming one — a
+  validated structured-output pass and true token streaming are in real tension.
+- **The frontend (`frontend/index.html`) points at a hardcoded `API_BASE`** — update it manually
+  to match wherever the app is currently deployed.
 
 ## Milestones
 
@@ -204,15 +274,15 @@ python -m src.evaluation.run_eval
 | `v0.2-week2-rag` | 2 | RAG over a real multi-document corpus, source attribution | ✅ |
 | `v0.3-week3-frontend` | 3 | SSE streaming frontend, function calling + RAG, eval harness | ✅ |
 | `v1.0-capstone` | 4 | Genuine multi-step agent, deployed on EC2 + ECR + CI/CD, Secrets Manager, IAM roles | ✅ |
+| `v1.1-week5-infra` | 5 | Docker Compose, ECS/Fargate via Terraform, semantic caching (Redis), rate limiting, load testing | ✅ |
 
 ## Live demo
 
-Deployed on a `t3.micro` EC2 instance — terminated between active use to avoid ongoing cost (see
-`ai-learning-journal`'s cleanup checklist). Redeploy via the steps in section 5 above; the image is
-always current in ECR via the CI/CD pipeline.
+Deployed on ECS/Fargate via Terraform — destroyed between active use to avoid ongoing cost
+(`terraform destroy`). Redeploy via the steps in section 5 above; the image is always current in
+ECR via the CI/CD pipeline.
 
-
-## Quick redeploy (after terminating the EC2 instance)
+## Quick redeploy (EC2 — legacy path, see Known gaps)
 
 The instance is deliberately terminated between active use to avoid ongoing cost. Spinning it back
 up takes about 5 minutes:
@@ -261,25 +331,15 @@ docker pull <account-id>.dkr.ecr.eu-north-1.amazonaws.com/production-rag-agent:l
 docker run -p 8000:8000 -d <account-id>.dkr.ecr.eu-north-1.amazonaws.com/production-rag-agent:latest
 ```
 No `--env-file` needed — the instance role supplies the OpenAI key via Secrets Manager directly.
+**Note:** this runs `app` alone, without `chroma`/`redis` as separate containers — the legacy
+embedded-mode assumptions no longer match `vectorstore.py`/`semantic_cache.py`'s current networked
+design. This path needs updating before it will actually work as-is.
 
-**6. Verify it's actually working, not just running**
-```bash
-curl http://<new-public-ip>:8000/health
-curl -X POST http://<new-public-ip>:8000/ask \
-  -H "Content-Type: application/json" \
-  -d '{"message": "Is the SummitCarry backpack in stock, and what does it cost?"}'
-```
-Expect `$249.00, out of stock` — the known-good result used to verify every deployment this
-project.
-
-**7. If testing the frontend against this live instance**
-Update `API_BASE` in `frontend/index.html` from `http://localhost:8000` to
-`http://<new-public-ip>:8000`, then reopen the file in a browser.
-
-**8. When done — terminate again, not just stop**
-
+**6. When done — terminate again, not just stop**
 
 ## Cleanup checklist (end of roadmap)
 
-- [x] ~~ECS service/cluster (Day 22)~~ - deleted same-day, 0 clusters confirmed
+- [x] ~~ECS service/cluster (Day 22, console-created)~~ - deleted same-day, 0 clusters confirmed
 - [ ] Lambda function `production-rag-chat` + its API Gateway HTTP API (Day 18)
+- [ ] Confirm Terraform-managed ECS resources are destroyed (`terraform destroy` in
+      `infra/terraform/`) if not actively in use
