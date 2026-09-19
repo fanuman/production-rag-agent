@@ -6,7 +6,6 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 COPY src/ ./src/
-COPY chroma_db/ ./chroma_db/
 
 ENV PYTHONUNBUFFERED=1
 
