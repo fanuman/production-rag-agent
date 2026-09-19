@@ -3,6 +3,7 @@ import redis
 import numpy as np
 import time
 import uuid
+import os
 from redis.commands.search.field import TextField, VectorField
 from redis.commands.search.indexDefinition import IndexDefinition, IndexType
 from redis.commands.search.query import Query
@@ -11,7 +12,8 @@ EMBEDDING_DIM = 1536  # text-embedding-3-small
 
 
 class SemanticCache:
-    def __init__(self, host="redis", port=6379, threshold=0.05, ttl_seconds=3600):
+    def __init__(self, host=None, port=6379, threshold=0.05, ttl_seconds=3600):
+        host = host or os.getenv("REDIS_HOST", "redis")  # "redis" = Compose default; ECS overrides to "localhost"
         self.client = redis.Redis(host=host, port=port, decode_responses=False)
         self.threshold = threshold
         self.ttl_seconds = ttl_seconds
