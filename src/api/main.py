@@ -20,6 +20,9 @@ from slowapi.errors import RateLimitExceeded
 from slowapi.middleware import SlowAPIMiddleware
 from fastapi import Request
 
+import os
+
+REDIS_HOST = os.getenv("REDIS_HOST", "redis")
 
 llm_client = None
 rag_pipeline = None
@@ -34,7 +37,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(lifespan=lifespan)
 
-limiter = Limiter(key_func=get_remote_address, storage_uri="redis://redis:6379/0")
+limiter = Limiter(key_func=get_remote_address, storage_uri=f"redis://{REDIS_HOST}:6379/0")
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
