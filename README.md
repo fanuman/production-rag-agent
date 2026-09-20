@@ -1,27 +1,32 @@
 # Production RAG Agent — TrailPeak Outdoors Assistant
 
-An agent-powered RAG chatbot, built incrementally over 5 weeks and deployed on AWS with CI/CD,
-IAM-managed secrets, semantic caching, rate limiting, and infrastructure defined as code.
+An agent-powered RAG chatbot, built incrementally over 5+ weeks and deployed on AWS with CI/CD,
+IAM-managed secrets, semantic caching, rate limiting, infrastructure defined as code, and LLM
+tracing.
 
 This repo wasn't rewritten each week — it grew. Each Saturday's project built directly on the
 last: a containerized chatbot (Week 1) became a real RAG pipeline over a governance corpus (Week
 2), then pivoted domains and gained function calling (Week 3), then became a genuine multi-step
 agent deployed to real cloud infrastructure with a full CI/CD pipeline (Week 4), then gained
 multi-container local dev, Redis-backed caching and rate limiting, and a Terraform-defined
-ECS/Fargate deployment replacing hand-clicked console setup (Week 5). The git tags below trace
-that progression; check tag history, not just the latest commit, to see it.
+ECS/Fargate deployment replacing hand-clicked console setup (Week 5), then gained LangSmith
+tracing for real request-level visibility (Week 6). The git tags below trace that progression;
+check tag history, not just the latest commit, to see it.
 
-## Status: v1.1 — Week 5 infrastructure complete
+## Status: v1.1 — Week 5 infrastructure complete, Week 6 observability underway
 
 The assistant answers questions for **TrailPeak Outdoors**, a fictional outdoor gear retailer.
 Product details and store policies come from RAG over real documents; current price and stock come
 from live function-calling tools; multi-step requests (checking several products, then totaling
 their cost) are handled by a genuine ReAct agent loop, not a single tool call. Repeated or
 paraphrased questions can be served from a Redis-backed semantic cache instead of re-running the
-full pipeline, and every expensive endpoint is rate-limited. The app is defined as three
-containers — `app`, `chroma`, `redis` — run together via Docker Compose locally and deployed to
-ECS/Fargate through Terraform, with the OpenAI API key supplied entirely by AWS Secrets Manager
-via an IAM task role — no access key or `.env` secret exists on the deployed infrastructure at all.
+full pipeline, and every expensive endpoint is rate-limited. Every request through the
+non-streaming path is traced end-to-end in LangSmith — retrieval, agent iterations, tool calls,
+and cache hits/misses, all visible as one structured trace rather than raw logs. The app is
+defined as three containers — `app`, `chroma`, `redis` — run together via Docker Compose locally
+and deployed to ECS/Fargate through Terraform, with the OpenAI API key supplied entirely by AWS
+Secrets Manager via an IAM task role — no access key or `.env` secret exists on the deployed
+infrastructure at all.
 
 ## Tech stack
 
@@ -34,6 +39,9 @@ via an IAM task role — no access key or `.env` secret exists on the deployed i
   distance rather than exact query match
 - `slowapi` — Redis-backed rate limiting, correct across multiple app instances, not just a
   single process
+- LangSmith (`langsmith`, `@traceable`) — per-request tracing of retrieval, the agent loop, and
+  tool calls, used standalone (not via LangChain, since the pipeline is hand-built on raw OpenAI
+  SDK calls)
 - AWS: IAM (users + roles), EC2, S3, Secrets Manager, CloudWatch (logs + alarms), ECR, ECS/Fargate
 - Terraform — the primary infrastructure definition for ECS/Fargate: cluster, IAM roles, security
   group, task definition, service, all as reviewable code rather than console clicks
@@ -66,6 +74,9 @@ via an IAM task role — no access key or `.env` secret exists on the deployed i
                   Chroma (own container,          Redis (own container,
                   networked, not embedded)         RediSearch + rate-limit counters)
 
+  answer(), retrieve(), and _run_agent_loop() are @traceable -->  LangSmith
+  (non-streaming path only; nested calls form one request tree per query)
+
   Three containers - app, chroma, redis - defined once in docker-compose.yml (local dev)
   and once in infra/terraform/ecs.tf (ECS/Fargate). Same shape, two environments.
 
@@ -82,6 +93,10 @@ call `CheckAvailability` and `CalculateTotal` in sequence, with each step's inpu
 real output of the step before it (e.g., totaling two products' prices only after actually looking
 both up) — not a single round of tool calling. A `max_iterations` cap fails safely, reporting
 incompleteness honestly rather than guessing from partial steps if the loop can't converge.
+`answer()`, `retrieve()`, and `_run_agent_loop()` are decorated `@traceable`, so every
+non-streaming request produces one nested LangSmith trace matching the real call structure with
+no manual wiring — retrieval's actual chunks and distances, each agent iteration, and the real
+tool calls and their results, all inspectable after the fact.
 
 **`core/semantic_cache.py`** — `SemanticCache` checks whether an incoming query is close enough
 (cosine distance over its embedding) to a previously answered query to reuse that answer instead
@@ -133,7 +148,7 @@ production-rag-agent/
 │   │   └── inventory.json
 │   ├── rag/
 │   │   ├── prompts.py
-│   │   └── pipeline.py
+│   │   └── pipeline.py       # answer/retrieve/_run_agent_loop are @traceable
 │   ├── evaluation/
 │   │   ├── prompts.py
 │   │   ├── metrics.py
@@ -174,6 +189,16 @@ pip install -r requirements.txt
 
 **2. Local config** — create `.env` in the repo root with `OPENAI_API_KEY=sk-...`. This is used
 directly for local development; in production, Secrets Manager takes over automatically.
+
+**2b. Optional: enable LangSmith tracing** — add to `.env`:
+```
+LANGCHAIN_TRACING_V2=true
+LANGCHAIN_API_KEY=ls__...
+LANGCHAIN_PROJECT=production-rag-agent
+```
+Traces appear at smith.langchain.com under the `production-rag-agent` project. Only the
+non-streaming `/ask` path is traced (see Known gaps). Without these variables set, the app runs
+identically — `@traceable` is a no-op if tracing isn't configured.
 
 **3. Run locally via Docker Compose** (recommended — matches the deployed three-container shape)
 ```bash
@@ -244,6 +269,19 @@ python -m src.evaluation.run_eval
 - **Chroma has no persistent storage in the ECS deployment.** Task replacement (a redeploy, a
   forced restart) always starts with an empty Chroma, requiring manual re-ingestion every time. A
   real fix — EFS-backed storage, or a managed vector store — is future work, not done here.
+- **Two mislabeled content bugs found via LangSmith trace inspection, not yet fixed:**
+  `product_catalog.txt`'s SummitCarry Backpack entry contains a chunk of tent-specific content
+  (DAC poles, rainfly, "tent body" in the included-items list) — almost certainly a copy-paste
+  error. A differently-phrased question relying more heavily on that chunk than the SummitCarry
+  test question does could produce a nonsensical answer. Similarly, a "REFUND TIMING" section in
+  the returns/warranty policy content actually describes warranty proof-of-purchase requirements,
+  not refund processing time. Both need a dedicated data-quality pass.
+- **`SemanticCache` never captures `sources`** — every cached response permanently returns
+  `sources: []`, even though the original (non-cached) answer had real sources. A known, minor gap
+  in `SemanticCache.store()`'s signature, not fixed yet.
+- **Only the non-streaming path is traced.** `answer_stream()` uses `yield`; tracing a generator
+  correctly needs more care than the current `@traceable` setup provides, so `/ask/stream`
+  requests currently produce no LangSmith trace at all.
 - **The full RAG pipeline isn't deployed via Lambda.** `infra/lambda/lambda_app.py` demonstrates
   serverless deployment for a scoped-down `/health` + `/chat` subset only — Lambda's package size
   limits and lack of persistent local disk make the locally-persisted Chroma index a poor fit
@@ -275,6 +313,7 @@ python -m src.evaluation.run_eval
 | `v0.3-week3-frontend` | 3 | SSE streaming frontend, function calling + RAG, eval harness | ✅ |
 | `v1.0-capstone` | 4 | Genuine multi-step agent, deployed on EC2 + ECR + CI/CD, Secrets Manager, IAM roles | ✅ |
 | `v1.1-week5-infra` | 5 | Docker Compose, ECS/Fargate via Terraform, semantic caching (Redis), rate limiting, load testing | ✅ |
+| _(Week 6, in progress)_ | 6 | LangSmith tracing, automated evaluation/regression testing, fine-tuning fundamentals, managed model serving, cost optimization | 🔄 |
 
 ## Live demo
 
@@ -340,6 +379,6 @@ design. This path needs updating before it will actually work as-is.
 ## Cleanup checklist (end of roadmap)
 
 - [x] ~~ECS service/cluster (Day 22, console-created)~~ - deleted same-day, 0 clusters confirmed
+- [x] ~~Terraform-managed ECS resources (Week 5 project)~~ - `terraform destroy` run, confirmed
+      0 running tasks, service INACTIVE
 - [ ] Lambda function `production-rag-chat` + its API Gateway HTTP API (Day 18)
-- [ ] Confirm Terraform-managed ECS resources are destroyed (`terraform destroy` in
-      `infra/terraform/`) if not actively in use

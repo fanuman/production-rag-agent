@@ -12,6 +12,8 @@ from src.tools.calculator_tool import TOOL_SCHEMA as CALC_SCHEMA, TOOL_FUNCTION 
 from src.rag.prompts import build_answer_prompt, FINAL_ANSWER_INSTRUCTION
 from src.core.semantic_cache import SemanticCache
 
+from langsmith import traceable
+
 
 class FinalAnswer(BaseModel):
     answer: str
@@ -34,6 +36,7 @@ class RAGPipeline:
             "items and calculating totals. What are you looking for?"
         )
 
+    @traceable(name="retrieve")
     def retrieve(self, query_embedding, k=None):
         k = k or self.k
         collection = get_collection()  # fetched fresh, every single call
@@ -43,6 +46,7 @@ class RAGPipeline:
     def _is_out_of_scope(self, distances):
         return all(d >= self.relevance_threshold for d in distances)
 
+    @traceable(name="agent_loop")
     def _run_agent_loop(self, messages):
         """ReAct loop (Day 16): keep letting the model act and observe
         until it stops requesting tools, or hit max_iterations as a
@@ -69,6 +73,7 @@ class RAGPipeline:
 
         return messages, tool_context_parts, True  # hit the cap without a final answer
 
+    @traceable(name="rag_answer")
     def answer(self, query, k=None):
         query_embedding = get_embedding(query)
 
