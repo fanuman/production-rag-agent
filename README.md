@@ -1,8 +1,8 @@
 # Production RAG Agent — TrailPeak Outdoors Assistant
 
 An agent-powered RAG chatbot, built incrementally over 5+ weeks and deployed on AWS with CI/CD,
-IAM-managed secrets, semantic caching, rate limiting, infrastructure defined as code, and LLM
-tracing.
+IAM-managed secrets, semantic caching, rate limiting, infrastructure defined as code, LLM tracing,
+and automated regression/A-B evaluation.
 
 This repo wasn't rewritten each week — it grew. Each Saturday's project built directly on the
 last: a containerized chatbot (Week 1) became a real RAG pipeline over a governance corpus (Week
@@ -10,10 +10,11 @@ last: a containerized chatbot (Week 1) became a real RAG pipeline over a governa
 agent deployed to real cloud infrastructure with a full CI/CD pipeline (Week 4), then gained
 multi-container local dev, Redis-backed caching and rate limiting, and a Terraform-defined
 ECS/Fargate deployment replacing hand-clicked console setup (Week 5), then gained LangSmith
-tracing for real request-level visibility (Week 6). The git tags below trace that progression;
-check tag history, not just the latest commit, to see it.
+tracing, context precision/recall metrics, and an automated regression + A/B testing harness
+(Week 6, in progress). The git tags below trace that progression; check tag history, not just the
+latest commit, to see it.
 
-## Status: v1.1 — Week 5 infrastructure complete, Week 6 observability underway
+## Status: v1.1 — Week 5 infrastructure complete, Week 6 observability + evaluation underway
 
 The assistant answers questions for **TrailPeak Outdoors**, a fictional outdoor gear retailer.
 Product details and store policies come from RAG over real documents; current price and stock come
@@ -22,11 +23,13 @@ their cost) are handled by a genuine ReAct agent loop, not a single tool call. R
 paraphrased questions can be served from a Redis-backed semantic cache instead of re-running the
 full pipeline, and every expensive endpoint is rate-limited. Every request through the
 non-streaming path is traced end-to-end in LangSmith — retrieval, agent iterations, tool calls,
-and cache hits/misses, all visible as one structured trace rather than raw logs. The app is
-defined as three containers — `app`, `chroma`, `redis` — run together via Docker Compose locally
-and deployed to ECS/Fargate through Terraform, with the OpenAI API key supplied entirely by AWS
-Secrets Manager via an IAM task role — no access key or `.env` secret exists on the deployed
-infrastructure at all.
+and cache hits/misses, all visible as one structured trace rather than raw logs. A golden-set
+evaluation harness scores every response on faithfulness, answer relevancy, context precision, and
+context recall, with automated regression detection against a saved baseline and an A/B test
+runner for comparing prompt variants. The app is defined as three containers — `app`, `chroma`,
+`redis` — run together via Docker Compose locally and deployed to ECS/Fargate through Terraform,
+with the OpenAI API key supplied entirely by AWS Secrets Manager via an IAM task role — no access
+key or `.env` secret exists on the deployed infrastructure at all.
 
 ## Tech stack
 
@@ -47,7 +50,9 @@ infrastructure at all.
   group, task definition, service, all as reviewable code rather than console clicks
 - GitHub Actions (CI/CD: test → build → push to ECR)
 - Locust — load testing, used to verify rate limiting and caching under real concurrent traffic
-- A hand-built RAG evaluation harness (faithfulness + answer relevancy, LLM-as-judge)
+- A hand-built RAG evaluation harness — faithfulness, answer relevancy, context precision, context
+  recall (LLM-as-judge where needed), run against a fixed golden set, with baseline-based
+  regression detection and an A/B test runner for comparing prompt variants
 - A separate, scoped-down AWS Lambda + API Gateway deployment (Mangum), demonstrating a second
   deployment model for `/health` + `/chat` only — see Known gaps below for why the full pipeline
   isn't deployed this way
@@ -61,7 +66,7 @@ infrastructure at all.
                          \                        /
                     core/llm_client.py (used by /chat only)
                     core/secrets.py -- Secrets Manager fetch, .env fallback for local dev
-                    rag/pipeline.py -- RAGPipeline
+                    rag/pipeline.py -- RAGPipeline (use_cache flag)
                                |         |          \
                                |         |           \
                    core/embeddings.py  core/       tools/inventory_tool.py (CheckAvailability)
@@ -85,7 +90,14 @@ infrastructure at all.
    against whichever Chroma           fetched on every call - not
    is currently live)                 cached at startup)
 
-  evaluation/run_eval.py --> RAGPipeline.answer() --> evaluation/metrics.py
+  golden_set.py --> run_eval.py --> RAGPipeline.answer() (use_cache=True)
+                                  --> metrics.py (faithfulness, relevancy,
+                                                   context precision/recall)
+                                  --> regression.py (vs. saved baseline)
+
+  golden_set.py --> ab_test.py --> two RAGPipeline instances (use_cache=False,
+                                    different final_answer_instruction)
+                                 --> metrics.py --> side-by-side comparison
 ```
 
 **`rag/pipeline.py`** — `RAGPipeline` runs a genuine ReAct loop (Day 16's pattern): the model can
@@ -95,8 +107,19 @@ both up) — not a single round of tool calling. A `max_iterations` cap fails sa
 incompleteness honestly rather than guessing from partial steps if the loop can't converge.
 `answer()`, `retrieve()`, and `_run_agent_loop()` are decorated `@traceable`, so every
 non-streaming request produces one nested LangSmith trace matching the real call structure with
-no manual wiring — retrieval's actual chunks and distances, each agent iteration, and the real
-tool calls and their results, all inspectable after the fact.
+no manual wiring. A `use_cache` constructor flag (default `True`) lets evaluation code bypass the
+semantic cache entirely — without it, a cache hit silently reuses a *previous* pipeline
+configuration's answer, which broke the A/B test's independence between variants before the flag
+was added (see Known gaps for the residual scoring implication).
+
+**`evaluation/`** — `golden_set.py` holds a fixed set of test questions with expected sources, the
+shared baseline both regression testing and A/B testing compare against. `metrics.py` scores
+faithfulness and answer relevancy (LLM-as-judge, structured output) plus context precision
+(deterministic — checks retrieved source *files* against expected ones) and context recall
+(LLM-judged — did retrieval find *enough*, tolerant of irrelevant content mixed in). `regression.py`
+saves a baseline and flags any future run where a metric drops by more than a threshold.
+`ab_test.py` runs the golden set through two differently-configured pipelines and compares real
+scores rather than eyeballing sample answers.
 
 **`core/semantic_cache.py`** — `SemanticCache` checks whether an incoming query is close enough
 (cosine distance over its embedding) to a previously answered query to reuse that answer instead
@@ -148,10 +171,14 @@ production-rag-agent/
 │   │   └── inventory.json
 │   ├── rag/
 │   │   ├── prompts.py
-│   │   └── pipeline.py       # answer/retrieve/_run_agent_loop are @traceable
+│   │   └── pipeline.py       # answer/retrieve/_run_agent_loop are @traceable; use_cache flag
 │   ├── evaluation/
 │   │   ├── prompts.py
-│   │   ├── metrics.py
+│   │   ├── metrics.py         # faithfulness, relevancy, context precision/recall
+│   │   ├── golden_set.py      # fixed test questions + expected sources
+│   │   ├── regression.py      # baseline save/compare
+│   │   ├── ab_test.py         # compare two pipeline configurations
+│   │   ├── baseline_scores.json  # gitignored - generated locally, not committed
 │   │   └── run_eval.py
 │   └── api/
 │       ├── main.py
@@ -259,10 +286,24 @@ locust -f locustfile.py --host=http://localhost:8000
 ```
 Opens a web UI at `localhost:8089`.
 
-**7. Run the eval harness** (offline, deliberately not on the live request path)
+**7. Run the evaluation harness** (offline, deliberately not on the live request path). Both
+commands below need Chroma/Redis reachable — via Compose (`CHROMA_HOST=localhost
+CHROMA_PORT=8001 REDIS_HOST=localhost`) or another live instance.
+
 ```bash
 python -m src.evaluation.run_eval
 ```
+Scores the golden set on faithfulness, answer relevancy, context precision, and context recall.
+First run saves a baseline (`baseline_scores.json`, gitignored); later runs flag any metric that
+drops by more than `REGRESSION_THRESHOLD` (currently an uncalibrated initial guess — see Known
+gaps).
+
+```bash
+python -m src.evaluation.ab_test
+```
+Compares two `final_answer_instruction` variants on the same golden set, with `use_cache=False`
+on both — required, since a cache hit would silently return one variant's old answer to the
+other's test, invalidating the comparison.
 
 ## Known gaps
 
@@ -272,13 +313,31 @@ python -m src.evaluation.run_eval
 - **Two mislabeled content bugs found via LangSmith trace inspection, not yet fixed:**
   `product_catalog.txt`'s SummitCarry Backpack entry contains a chunk of tent-specific content
   (DAC poles, rainfly, "tent body" in the included-items list) — almost certainly a copy-paste
-  error. A differently-phrased question relying more heavily on that chunk than the SummitCarry
-  test question does could produce a nonsensical answer. Similarly, a "REFUND TIMING" section in
-  the returns/warranty policy content actually describes warranty proof-of-purchase requirements,
-  not refund processing time. Both need a dedicated data-quality pass.
+  error. Similarly, a "REFUND TIMING" section in the returns/warranty policy content actually
+  describes warranty proof-of-purchase requirements, not refund processing time. **Confirmed that
+  context precision and context recall, as currently designed, cannot detect either bug** —
+  precision only checks retrieved source *files* (both bugs sit inside correctly-named files), and
+  recall is deliberately tolerant of irrelevant content as long as sufficient correct content is
+  present alongside it. Both need a dedicated data-quality pass; a future "does each chunk's
+  content match its claimed topic" check would be a different kind of metric than either.
+- **A real content gap found via `context_recall`**: no tent in the catalog is actually rated for
+  winter camping — the only tent (AlpinePeak) is explicitly 3-season only. Not a bug; a genuine
+  product-catalog limitation worth a business decision (add a winter-rated SKU, or make the
+  limitation explicit in the assistant's answer).
+- **`REGRESSION_THRESHOLD` (0.1) is an initial guess, not calibrated** against actual measured
+  run-to-run LLM-judge variance. A live example was found during Day 27's A/B testing: the same
+  question, essentially the same answer text, scored `faithfulness` 0.33 in one run and 1.00 in
+  another purely from judge inconsistency — exactly the kind of noise the threshold needs to
+  tolerate without either missing real regressions or crying wolf constantly.
+- **`context_precision` depends on `parsed.sources_used`**, which is the model's own self-reported
+  list of sources from the final structured-output call, not an independently verified ground
+  truth — some precision variance between otherwise-similar runs may come from this self-report
+  shifting slightly rather than retrieval itself changing.
 - **`SemanticCache` never captures `sources`** — every cached response permanently returns
-  `sources: []`, even though the original (non-cached) answer had real sources. A known, minor gap
-  in `SemanticCache.store()`'s signature, not fixed yet.
+  `sources: []`, even though the original (non-cached) answer had real sources. This also means
+  any cached answer scores `context_precision: 0.0` by construction (empty source list), unrelated
+  to real retrieval quality — evaluation code must run with `use_cache=False` to get meaningful
+  precision scores. A known, minor gap in `SemanticCache.store()`'s signature, not fixed yet.
 - **Only the non-streaming path is traced.** `answer_stream()` uses `yield`; tracing a generator
   correctly needs more care than the current `@traceable` setup provides, so `/ask/stream`
   requests currently produce no LangSmith trace at all.
@@ -313,7 +372,7 @@ python -m src.evaluation.run_eval
 | `v0.3-week3-frontend` | 3 | SSE streaming frontend, function calling + RAG, eval harness | ✅ |
 | `v1.0-capstone` | 4 | Genuine multi-step agent, deployed on EC2 + ECR + CI/CD, Secrets Manager, IAM roles | ✅ |
 | `v1.1-week5-infra` | 5 | Docker Compose, ECS/Fargate via Terraform, semantic caching (Redis), rate limiting, load testing | ✅ |
-| _(Week 6, in progress)_ | 6 | LangSmith tracing, automated evaluation/regression testing, fine-tuning fundamentals, managed model serving, cost optimization | 🔄 |
+| _(Week 6, in progress)_ | 6 | LangSmith tracing, context precision/recall, regression + A/B testing harness, fine-tuning fundamentals, managed model serving, cost optimization | 🔄 |
 
 ## Live demo
 

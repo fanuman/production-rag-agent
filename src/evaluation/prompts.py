@@ -25,5 +25,17 @@ On a scale of 1-5, how well does this answer address the question?
 1 = completely off-topic, 5 = directly and fully addresses the question.
 Consider only whether it addresses the question, not whether it's factually correct."""
 
+def context_recall_prompt(question: str, context: str) -> str:
+    return f"""Question: {question}
+
+Retrieved context:
+\"\"\"
+{context}
+\"\"\"
+
+Does the retrieved context above contain enough information to fully and accurately answer the
+question - regardless of whether it also contains irrelevant or incorrect information alongside
+the useful part?"""
+
 
 REFUSAL_PHRASES = ["i don't have information", "i don't know", "no document matches"]

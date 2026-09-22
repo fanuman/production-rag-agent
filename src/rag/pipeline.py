@@ -21,7 +21,7 @@ class FinalAnswer(BaseModel):
 
 
 class RAGPipeline:
-    def __init__(self, model=DEFAULT_MODEL, relevance_threshold=RELEVANCE_THRESHOLD, k=RETRIEVAL_K, max_iterations=6):
+    def __init__(self, model=DEFAULT_MODEL, relevance_threshold=RELEVANCE_THRESHOLD, k=RETRIEVAL_K, max_iterations=6, final_answer_instruction=None, use_cache=True):
         self.client = OpenAI()
         self.model = model
         self.relevance_threshold = relevance_threshold
@@ -30,6 +30,8 @@ class RAGPipeline:
         self.tools = [AVAILABILITY_SCHEMA, CALC_SCHEMA]
         self.available_functions = {**AVAILABILITY_FUNCTION, **CALC_FUNCTION}
         self.cache = SemanticCache()
+        self.use_cache = use_cache
+        self.final_answer_instruction = final_answer_instruction or FINAL_ANSWER_INSTRUCTION
         self.FALLBACK_MESSAGE =  (
             "Hi! I'm the TrailPeak Outdoors assistant. I can help with product details, "
             "current price and stock, shipping/returns/warranty questions, or comparing "
@@ -78,7 +80,7 @@ class RAGPipeline:
         query_embedding = get_embedding(query)
 
         # Check if the response is already cached in Redis
-        cached = self.cache.check(query_embedding=query_embedding)
+        cached = self.cache.check(query_embedding=query_embedding) if self.use_cache else None
         if cached:
             return {
                 "answer": cached["response"],
@@ -112,11 +114,11 @@ class RAGPipeline:
             return {"answer": "I wasn't able to fully work through this request - it may need to be broken into simpler questions.",
                     "sources": list(set(sources)), "used_fallback": True, "full_context": full_context, "from_cache": False}
 
-        messages.append({"role": "user", "content": FINAL_ANSWER_INSTRUCTION})
+        messages.append({"role": "user", "content": self.final_answer_instruction})
         final = self.client.chat.completions.parse(model=self.model, messages=messages, response_format=FinalAnswer)
         parsed = final.choices[0].message.parsed
 
-        if not tool_context_parts and not hit_cap:
+        if not tool_context_parts and not hit_cap and self.use_cache:
             self.cache.store(query, parsed.answer, query_embedding, full_context)
 
         return {"answer": parsed.answer, "sources": parsed.sources_used,
@@ -125,7 +127,7 @@ class RAGPipeline:
     def answer_stream(self, query, k=None):
         query_embedding = get_embedding(query)
 
-        cached = self.cache.check(query_embedding=query_embedding)
+        cached = self.cache.check(query_embedding=query_embedding) if self.use_cache else None
         if cached:
             yield f"event: sources\ndata: {json.dumps([])}\n\n"
             yield f"data: {cached['response']}\n\n"
@@ -163,7 +165,7 @@ class RAGPipeline:
                     full_reply += delta
                     yield f"data: {delta}\n\n"
 
-        if not tool_context_parts:
+        if not tool_context_parts and self.use_cache:
             self.cache.store(query, full_reply, query_embedding, full_context)
 
         yield "data: [DONE]\n\n"

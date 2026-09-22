@@ -16,3 +16,4 @@ lambda_package/
 infra/terraform/.terraform/
 infra/terraform/terraform.tfstate*
 infra/terraform/terraform.tfvars
+src/evaluation/baseline_scores.json

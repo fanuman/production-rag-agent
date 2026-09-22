@@ -4,7 +4,8 @@ from openai import OpenAI
 
 from src.core.config import DEFAULT_MODEL
 from src.evaluation.prompts import (
-    extract_claims_prompt, verify_claim_prompt, answer_relevancy_prompt, REFUSAL_PHRASES
+    extract_claims_prompt, verify_claim_prompt, answer_relevancy_prompt, 
+    context_recall_prompt, REFUSAL_PHRASES
 )
 
 _client = OpenAI()
@@ -19,6 +20,10 @@ class ClaimVerdict(BaseModel):
 
 class RelevancyScore(BaseModel):
     score: int  # 1-5
+    reasoning: str
+
+class RecallVerdict(BaseModel):
+    sufficient: bool
     reasoning: str
 
 
@@ -57,6 +62,29 @@ def answer_relevancy_score(question: str, answer: str) -> RelevancyScore:
         model=DEFAULT_MODEL,
         messages=[{"role": "user", "content": answer_relevancy_prompt(question, answer)}],
         response_format=RelevancyScore
+    )
+    return response.choices[0].message.parsed
+
+
+def context_precision(retrieved_sources: list[str], expected_sources: list[str]) -> float:
+    """Deterministic - no LLM call. Of the sources actually retrieved, what
+    fraction were genuinely relevant? Note: this checks source FILES, not
+    chunk CONTENT - a mislabeled chunk inside a correct source file won't
+    be caught here (see Day 26's tent-content bug in product_catalog.txt)."""
+    if not retrieved_sources:
+        return 0.0
+    relevant = sum(1 for s in retrieved_sources if s in expected_sources)
+    return relevant / len(retrieved_sources)
+
+def context_recall(question: str, context: str) -> RecallVerdict:
+    """LLM-judged - did retrieval find ENOUGH to answer, even with noise
+    mixed in alongside it? Complements context_precision: precision checks
+    whether retrieved SOURCES were relevant, recall checks whether the
+    CONTENT was sufficient - catching a case precision alone can't see."""
+    response = _client.chat.completions.parse(
+        model=DEFAULT_MODEL,
+        messages=[{"role": "user", "content": context_recall_prompt(question, context)}],
+        response_format=RecallVerdict
     )
     return response.choices[0].message.parsed
 
