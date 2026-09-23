@@ -2,7 +2,8 @@
 
 An agent-powered RAG chatbot, built incrementally over 5+ weeks and deployed on AWS with CI/CD,
 IAM-managed secrets, semantic caching, rate limiting, infrastructure defined as code, LLM tracing,
-and automated regression/A-B evaluation.
+automated regression/A-B evaluation, and a fine-tuning dataset prepared (not yet trained) for a
+behavior gap found during evaluation.
 
 This repo wasn't rewritten each week — it grew. Each Saturday's project built directly on the
 last: a containerized chatbot (Week 1) became a real RAG pipeline over a governance corpus (Week
@@ -10,9 +11,9 @@ last: a containerized chatbot (Week 1) became a real RAG pipeline over a governa
 agent deployed to real cloud infrastructure with a full CI/CD pipeline (Week 4), then gained
 multi-container local dev, Redis-backed caching and rate limiting, and a Terraform-defined
 ECS/Fargate deployment replacing hand-clicked console setup (Week 5), then gained LangSmith
-tracing, context precision/recall metrics, and an automated regression + A/B testing harness
-(Week 6, in progress). The git tags below trace that progression; check tag history, not just the
-latest commit, to see it.
+tracing, context precision/recall metrics, an automated regression + A/B testing harness, and a
+fine-tuning dataset for a real behavior gap found through that harness (Week 6, in progress). The
+git tags below trace that progression; check tag history, not just the latest commit, to see it.
 
 ## Status: v1.1 — Week 5 infrastructure complete, Week 6 observability + evaluation underway
 
@@ -26,10 +27,12 @@ non-streaming path is traced end-to-end in LangSmith — retrieval, agent iterat
 and cache hits/misses, all visible as one structured trace rather than raw logs. A golden-set
 evaluation harness scores every response on faithfulness, answer relevancy, context precision, and
 context recall, with automated regression detection against a saved baseline and an A/B test
-runner for comparing prompt variants. The app is defined as three containers — `app`, `chroma`,
-`redis` — run together via Docker Compose locally and deployed to ECS/Fargate through Terraform,
-with the OpenAI API key supplied entirely by AWS Secrets Manager via an IAM task role — no access
-key or `.env` secret exists on the deployed infrastructure at all.
+runner for comparing prompt variants. A small fine-tuning dataset exists for one behavior gap that
+evaluation surfaced (inconsistent "we don't carry that" responses), uploaded but deliberately not
+yet trained on — see Known gaps. The app is defined as three containers — `app`, `chroma`, `redis`
+— run together via Docker Compose locally and deployed to ECS/Fargate through Terraform, with the
+OpenAI API key supplied entirely by AWS Secrets Manager via an IAM task role — no access key or
+`.env` secret exists on the deployed infrastructure at all.
 
 ## Tech stack
 
@@ -53,6 +56,9 @@ key or `.env` secret exists on the deployed infrastructure at all.
 - A hand-built RAG evaluation harness — faithfulness, answer relevancy, context precision, context
   recall (LLM-as-judge where needed), run against a fixed golden set, with baseline-based
   regression detection and an A/B test runner for comparing prompt variants
+- OpenAI fine-tuning (Files API + Fine-tuning API) — a prepared training dataset for a specific
+  behavior pattern, with the actual training job left as a deliberate, uncommitted decision (see
+  Known gaps)
 - A separate, scoped-down AWS Lambda + API Gateway deployment (Mangum), demonstrating a second
   deployment model for `/health` + `/chat` only — see Known gaps below for why the full pipeline
   isn't deployed this way
@@ -98,6 +104,13 @@ key or `.env` secret exists on the deployed infrastructure at all.
   golden_set.py --> ab_test.py --> two RAGPipeline instances (use_cache=False,
                                     different final_answer_instruction)
                                  --> metrics.py --> side-by-side comparison
+
+  finetuning/training_data.py --> datasets/no_match_pattern.jsonl
+                               --> upload_and_train.py --> Files API (uploaded)
+                                                         --> Fine-tuning API
+                                                             (job creation - NOT yet run;
+                                                              standalone, not wired into
+                                                              RAGPipeline anywhere)
 ```
 
 **`rag/pipeline.py`** — `RAGPipeline` runs a genuine ReAct loop (Day 16's pattern): the model can
@@ -120,6 +133,15 @@ faithfulness and answer relevancy (LLM-as-judge, structured output) plus context
 saves a baseline and flags any future run where a metric drops by more than a threshold.
 `ab_test.py` runs the golden set through two differently-configured pipelines and compares real
 scores rather than eyeballing sample answers.
+
+**`finetuning/`** — a small, standalone module, not wired into `RAGPipeline` or the API at all.
+`training_data.py` defines 12 examples teaching a consistent three-part structure (acknowledge the
+gap, offer the closest real alternative, offer to help further) for questions about products
+TrailPeak doesn't carry — directly motivated by a real inconsistency `context_recall` surfaced
+during evaluation. `upload_and_train.py` uploads the dataset (free) and stops; job creation
+(the step that actually costs money to train, and produces a model that costs more per token at
+inference) is written but deliberately left commented out. No fine-tuned model currently exists
+for this project — see Known gaps.
 
 **`core/semantic_cache.py`** — `SemanticCache` checks whether an incoming query is close enough
 (cosine distance over its embedding) to a previously answered query to reuse that answer instead
@@ -180,6 +202,11 @@ production-rag-agent/
 │   │   ├── ab_test.py         # compare two pipeline configurations
 │   │   ├── baseline_scores.json  # gitignored - generated locally, not committed
 │   │   └── run_eval.py
+│   ├── finetuning/
+│   │   ├── training_data.py           # 12 examples, "no good match" response pattern
+│   │   ├── datasets/
+│   │   │   └── no_match_pattern.jsonl # generated, small enough to commit
+│   │   └── upload_and_train.py        # upload runs; job creation left commented out
 │   └── api/
 │       ├── main.py
 │       └── models.py
@@ -305,8 +332,23 @@ Compares two `final_answer_instruction` variants on the same golden set, with `u
 on both — required, since a cache hit would silently return one variant's old answer to the
 other's test, invalidating the comparison.
 
+**8. Fine-tuning dataset (prepared, not trained)**
+```bash
+python -m src.finetuning.training_data       # writes datasets/no_match_pattern.jsonl
+python -m src.finetuning.upload_and_train    # uploads the file (free); stops there
+```
+To actually train (costs real money — see Known gaps), open `upload_and_train.py` and uncomment
+the `create_job(...)` call at the bottom before re-running.
+
 ## Known gaps
 
+- **No fine-tuned model exists yet.** The Day 28 dataset (12 examples) is uploaded but the
+  training job was deliberately never submitted — training is charged per token (multiplied by
+  epochs, default 3) and the resulting model costs more per token at inference, ongoing. A
+  12-example dataset is also genuinely small for a production-quality result (50-100+ varied
+  examples would be a more realistic target); running the job today would have spent real money
+  for a minimal, not fully reliable improvement. `create_job()` is written and ready, deliberately
+  left commented out rather than run by default.
 - **Chroma has no persistent storage in the ECS deployment.** Task replacement (a redeploy, a
   forced restart) always starts with an empty Chroma, requiring manual re-ingestion every time. A
   real fix — EFS-backed storage, or a managed vector store — is future work, not done here.
@@ -323,7 +365,8 @@ other's test, invalidating the comparison.
 - **A real content gap found via `context_recall`**: no tent in the catalog is actually rated for
   winter camping — the only tent (AlpinePeak) is explicitly 3-season only. Not a bug; a genuine
   product-catalog limitation worth a business decision (add a winter-rated SKU, or make the
-  limitation explicit in the assistant's answer).
+  limitation explicit in the assistant's answer). The Day 28 fine-tuning dataset addresses how the
+  assistant *talks about* this kind of gap generally, not the underlying catalog gap itself.
 - **`REGRESSION_THRESHOLD` (0.1) is an initial guess, not calibrated** against actual measured
   run-to-run LLM-judge variance. A live example was found during Day 27's A/B testing: the same
   question, essentially the same answer text, scored `faithfulness` 0.33 in one run and 1.00 in
@@ -372,7 +415,7 @@ other's test, invalidating the comparison.
 | `v0.3-week3-frontend` | 3 | SSE streaming frontend, function calling + RAG, eval harness | ✅ |
 | `v1.0-capstone` | 4 | Genuine multi-step agent, deployed on EC2 + ECR + CI/CD, Secrets Manager, IAM roles | ✅ |
 | `v1.1-week5-infra` | 5 | Docker Compose, ECS/Fargate via Terraform, semantic caching (Redis), rate limiting, load testing | ✅ |
-| _(Week 6, in progress)_ | 6 | LangSmith tracing, context precision/recall, regression + A/B testing harness, fine-tuning fundamentals, managed model serving, cost optimization | 🔄 |
+| _(Week 6, in progress)_ | 6 | LangSmith tracing, context precision/recall, regression + A/B testing harness, fine-tuning dataset (prepared, untrained), managed model serving, cost optimization | 🔄 |
 
 ## Live demo
 
