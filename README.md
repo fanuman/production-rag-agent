@@ -59,6 +59,9 @@ OpenAI API key supplied entirely by AWS Secrets Manager via an IAM task role —
 - OpenAI fine-tuning (Files API + Fine-tuning API) — a prepared training dataset for a specific
   behavior pattern, with the actual training job left as a deliberate, uncommitted decision (see
   Known gaps)
+- AWS Bedrock (`boto3`, Converse API) — a second, interchangeable inference backend for the same
+  prompt, compared side by side against the OpenAI API directly (`finetuning/bedrock_comparison.py`)
+  for latency and output; not wired into `RAGPipeline` itself
 - A separate, scoped-down AWS Lambda + API Gateway deployment (Mangum), demonstrating a second
   deployment model for `/health` + `/chat` only — see Known gaps below for why the full pipeline
   isn't deployed this way
@@ -111,6 +114,13 @@ OpenAI API key supplied entirely by AWS Secrets Manager via an IAM task role —
                                                              (job creation - NOT yet run;
                                                               standalone, not wired into
                                                               RAGPipeline anywhere)
+
+  finetuning/bedrock_comparison.py --> OpenAI API (chat.completions)
+                                    --> boto3 bedrock-runtime.converse()
+                                        (eu.anthropic.claude-haiku-4-5-20251001-v1:0,
+                                         an inference profile ID, not the raw model ID)
+                                    --> side-by-side latency/output comparison
+                                        (standalone script, not wired into RAGPipeline)
 ```
 
 **`rag/pipeline.py`** — `RAGPipeline` runs a genuine ReAct loop (Day 16's pattern): the model can
@@ -142,6 +152,13 @@ during evaluation. `upload_and_train.py` uploads the dataset (free) and stops; j
 (the step that actually costs money to train, and produces a model that costs more per token at
 inference) is written but deliberately left commented out. No fine-tuned model currently exists
 for this project — see Known gaps.
+
+**`finetuning/bedrock_comparison.py`** — also standalone (and, admittedly, misplaced under
+`finetuning/` rather than its own module — see Known gaps), this script calls the same prompt
+against the OpenAI API and against AWS Bedrock's Converse API for the same Claude model, side by
+side, to compare latency and output directly rather than by reputation. Uses
+`eu.anthropic.claude-haiku-4-5-20251001-v1:0` — the *inference profile* ID, not the raw model ID,
+which several newer/higher-demand Bedrock models require instead of plain on-demand throughput.
 
 **`core/semantic_cache.py`** — `SemanticCache` checks whether an incoming query is close enough
 (cosine distance over its embedding) to a previously answered query to reuse that answer instead
@@ -206,7 +223,8 @@ production-rag-agent/
 │   │   ├── training_data.py           # 12 examples, "no good match" response pattern
 │   │   ├── datasets/
 │   │   │   └── no_match_pattern.jsonl # generated, small enough to commit
-│   │   └── upload_and_train.py        # upload runs; job creation left commented out
+│   │   ├── upload_and_train.py        # upload runs; job creation left commented out
+│   │   └── bedrock_comparison.py      # OpenAI vs. Bedrock Converse API, side by side
 │   └── api/
 │       ├── main.py
 │       └── models.py
@@ -340,6 +358,14 @@ python -m src.finetuning.upload_and_train    # uploads the file (free); stops th
 To actually train (costs real money — see Known gaps), open `upload_and_train.py` and uncomment
 the `create_job(...)` call at the bottom before re-running.
 
+**9. Compare OpenAI vs. AWS Bedrock** (needs AWS credentials with Bedrock access — see Known gaps
+for the exact IAM permissions this required)
+```bash
+python -m src.finetuning.bedrock_comparison
+```
+Calls the same prompt against both `gpt-4o-mini` and `eu.anthropic.claude-haiku-4-5-20251001-v1:0`
+(a Bedrock inference profile, not a raw model ID) and prints latency + output for both.
+
 ## Known gaps
 
 - **No fine-tuned model exists yet.** The Day 28 dataset (12 examples) is uploaded but the
@@ -392,6 +418,9 @@ the `create_job(...)` call at the bottom before re-running.
   actively-used deployment model is the Terraform/ECS path above.
 - **`terraform.tfvars` (the real IP value) is per-person and gitignored** — anyone else running
   this Terraform config needs to supply their own before `apply` will work.
+- **The OpenAI vs. Bedrock latency comparison is a single sample per backend** (one call each),
+  not a benchmark — a real comparison would need multiple runs to separate genuine latency
+  differences from ordinary network/API noise on a given call.
 - **A narrow retrieval edge case**: some natural phrasings of meta-questions ("what does your
   company sell") don't score well enough against `about_us.txt` to beat the relevance threshold,
   and raising the threshold isn't a safe fix (a known-irrelevant query scored better than a second
