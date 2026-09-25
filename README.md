@@ -62,6 +62,9 @@ OpenAI API key supplied entirely by AWS Secrets Manager via an IAM task role —
 - AWS Bedrock (`boto3`, Converse API) — a second, interchangeable inference backend for the same
   prompt, compared side by side against the OpenAI API directly (`finetuning/bedrock_comparison.py`)
   for latency and output; not wired into `RAGPipeline` itself
+- A hand-built cost tracking module (`cost/`) — turns every OpenAI call's real token usage into an
+  actual dollar figure, logged per pipeline stage, with a hypothetical-cost comparison against a
+  pricier model computed from the same token counts (no extra API spend required to see it)
 - A separate, scoped-down AWS Lambda + API Gateway deployment (Mangum), demonstrating a second
   deployment model for `/health` + `/chat` only — see Known gaps below for why the full pipeline
   isn't deployed this way
@@ -121,6 +124,13 @@ OpenAI API key supplied entirely by AWS Secrets Manager via an IAM task role —
                                          an inference profile ID, not the raw model ID)
                                     --> side-by-side latency/output comparison
                                         (standalone script, not wired into RAGPipeline)
+
+  rag/pipeline.py (_run_agent_loop, answer, answer_stream)
+       --> cost/tracker.py.record() on every chat.completions call
+             --> cost/pricing.py (actual cost + hypothetical gpt-4o cost,
+                                   same token counts, no extra API call)
+             --> logs/cost_log.jsonl (persists across separate runs/processes)
+                     --> cost/report.py (aggregate: total, by model, by stage)
 ```
 
 **`rag/pipeline.py`** — `RAGPipeline` runs a genuine ReAct loop (Day 16's pattern): the model can
@@ -159,6 +169,18 @@ against the OpenAI API and against AWS Bedrock's Converse API for the same Claud
 side, to compare latency and output directly rather than by reputation. Uses
 `eu.anthropic.claude-haiku-4-5-20251001-v1:0` — the *inference profile* ID, not the raw model ID,
 which several newer/higher-demand Bedrock models require instead of plain on-demand throughput.
+
+**`cost/`** — `tracker.py`'s `cost_tracker.record(model, input_tokens, output_tokens, label)` is
+called after every `chat.completions` call in `rag/pipeline.py` (each agent-loop iteration, the
+final structured-output call, and the streaming path via `stream_options={"include_usage": True}`,
+since token usage isn't included in a streamed response by default). `pricing.py` holds a small
+per-model USD-per-million-token table and is the only place that computes a dollar amount.
+Deliberately **does not implement actual cheap/expensive model routing** — every call still uses
+`gpt-4o-mini` — but each recorded call also logs what the *same* token counts would have cost on
+`gpt-4o`, purely as arithmetic on numbers already in hand, so the routing argument has real
+evidence behind it without ever spending on the pricier model. `report.py` reads the persisted
+`logs/cost_log.jsonl` (not just in-process memory), so cost visibility survives across separate
+CLI/API runs. See Known gaps for what this doesn't cover yet.
 
 **`core/semantic_cache.py`** — `SemanticCache` checks whether an incoming query is close enough
 (cosine distance over its embedding) to a previously answered query to reuse that answer instead
@@ -225,6 +247,10 @@ production-rag-agent/
 │   │   │   └── no_match_pattern.jsonl # generated, small enough to commit
 │   │   ├── upload_and_train.py        # upload runs; job creation left commented out
 │   │   └── bedrock_comparison.py      # OpenAI vs. Bedrock Converse API, side by side
+│   ├── cost/
+│   │   ├── pricing.py         # per-model USD/1M-token table
+│   │   ├── tracker.py         # records real usage + hypothetical gpt-4o cost
+│   │   └── report.py          # aggregate report from logs/cost_log.jsonl
 │   └── api/
 │       ├── main.py
 │       └── models.py
@@ -243,6 +269,7 @@ production-rag-agent/
 │       └── terraform.tfvars    # gitignored - personal IP, not committed
 ├── data/                    # original source documents - committed, not gitignored
 ├── chroma_db/               # persisted index - gitignored, rebuilt from source every time
+├── logs/                    # cost_log.jsonl - gitignored, generated locally
 ├── docker-compose.yml
 ├── locustfile.py
 ├── .github/workflows/
@@ -276,6 +303,14 @@ identically — `@traceable` is a no-op if tracing isn't configured.
 ```bash
 docker compose up --build
 ```
+`src/`, `data/`, and `logs/` are bind-mounted into the `app` container, and its command overrides
+the Dockerfile's `CMD` to add `--reload` — so editing code under `src/` restarts the app inside the
+container automatically, no rebuild needed, and files like `logs/cost_log.jsonl` are readable
+directly from the host. The override lives in `docker-compose.yml`, not the Dockerfile itself,
+because that same Dockerfile is what CI/CD builds and pushes to ECR for the ECS/Fargate deployment
+— baking `--reload` into the image would ship a dev-only file-watcher into production. A rebuild
+(`--build`) is still needed whenever `requirements.txt` changes; the mount only covers code edits.
+
 Then, in a separate terminal, ingest into the running stack:
 ```bash
 CHROMA_HOST=localhost CHROMA_PORT=8001 python -m src.ingest
@@ -366,6 +401,15 @@ python -m src.finetuning.bedrock_comparison
 Calls the same prompt against both `gpt-4o-mini` and `eu.anthropic.claude-haiku-4-5-20251001-v1:0`
 (a Bedrock inference profile, not a raw model ID) and prints latency + output for both.
 
+**10. Cost tracking report** (needs at least one `/ask` request made first, so there's something
+to report on)
+```bash
+python -m src.cost.report
+```
+Prints total calls, actual cost, what the same calls would have cost on `gpt-4o` instead, and a
+breakdown by pipeline stage (`agent_iteration` vs. `final_answer`). Reads `logs/cost_log.jsonl`
+directly, so it works the same whether requests came from `cli.py` or the API.
+
 ## Known gaps
 
 - **No fine-tuned model exists yet.** The Day 28 dataset (12 examples) is uploaded but the
@@ -421,6 +465,16 @@ Calls the same prompt against both `gpt-4o-mini` and `eu.anthropic.claude-haiku-
 - **The OpenAI vs. Bedrock latency comparison is a single sample per backend** (one call each),
   not a benchmark — a real comparison would need multiple runs to separate genuine latency
   differences from ordinary network/API noise on a given call.
+- **No actual cheap/expensive model routing is implemented** — every call still runs on
+  `gpt-4o-mini`. `cost/tracker.py` logs what the same token counts *would* cost on `gpt-4o`
+  purely as a hypothetical, deliberately without ever calling it, so the routing argument has real
+  numbers behind it without spending on the pricier model. Whether to actually build routing logic
+  (and on what signal — keyword heuristic, a cheap classifier call, or a fallback-on-failure
+  pattern) is an open decision, not done here.
+- **Embedding calls aren't cost-tracked.** `get_embedding()` (`text-embedding-3-small`) runs at the
+  top of both `answer()` and `answer_stream()` but isn't wired into `cost/tracker.py` — real cost,
+  but roughly two orders of magnitude cheaper than a chat completion at this scale, so it was left
+  out of today's scope rather than treated as a meaningful gap in the totals.
 - **A narrow retrieval edge case**: some natural phrasings of meta-questions ("what does your
   company sell") don't score well enough against `about_us.txt` to beat the relevance threshold,
   and raising the threshold isn't a safe fix (a known-irrelevant query scored better than a second

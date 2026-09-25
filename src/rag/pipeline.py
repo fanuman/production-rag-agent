@@ -11,6 +11,7 @@ from src.tools.inventory_tool import TOOL_SCHEMA as AVAILABILITY_SCHEMA, TOOL_FU
 from src.tools.calculator_tool import TOOL_SCHEMA as CALC_SCHEMA, TOOL_FUNCTION as CALC_FUNCTION
 from src.rag.prompts import build_answer_prompt, FINAL_ANSWER_INSTRUCTION
 from src.core.semantic_cache import SemanticCache
+from src.cost.tracker import cost_tracker
 
 from langsmith import traceable
 
@@ -60,6 +61,12 @@ class RAGPipeline:
         for _ in range(self.max_iterations):
             response = self.client.chat.completions.create(
                 model=self.model, messages=messages, tools=self.tools
+            )
+            cost_tracker.record(
+                model=self.model,
+                input_tokens=response.usage.prompt_tokens,
+                output_tokens=response.usage.completion_tokens,
+                label="agent_iteration",
             )
             response_message = response.choices[0].message
 
@@ -116,6 +123,12 @@ class RAGPipeline:
 
         messages.append({"role": "user", "content": self.final_answer_instruction})
         final = self.client.chat.completions.parse(model=self.model, messages=messages, response_format=FinalAnswer)
+        cost_tracker.record(
+            model=self.model,
+            input_tokens=final.usage.prompt_tokens,
+            output_tokens=final.usage.completion_tokens,
+            label="final_answer",
+        )
         parsed = final.choices[0].message.parsed
 
         if not tool_context_parts and not hit_cap and self.use_cache:
@@ -164,6 +177,13 @@ class RAGPipeline:
                 if delta:
                     full_reply += delta
                     yield f"data: {delta}\n\n"
+            if chunk.usage:
+                cost_tracker.record(
+                    model=self.model,
+                    input_tokens=chunk.usage.prompt_tokens,
+                    output_tokens=chunk.usage.completion_tokens,
+                    label="stream_answer",
+                )
 
         if not tool_context_parts and self.use_cache:
             self.cache.store(query, full_reply, query_embedding, full_context)
