@@ -11,11 +11,12 @@ last: a containerized chatbot (Week 1) became a real RAG pipeline over a governa
 agent deployed to real cloud infrastructure with a full CI/CD pipeline (Week 4), then gained
 multi-container local dev, Redis-backed caching and rate limiting, and a Terraform-defined
 ECS/Fargate deployment replacing hand-clicked console setup (Week 5), then gained LangSmith
-tracing, context precision/recall metrics, an automated regression + A/B testing harness, and a
-fine-tuning dataset for a real behavior gap found through that harness (Week 6, in progress). The
-git tags below trace that progression; check tag history, not just the latest commit, to see it.
+tracing, context precision/recall metrics, an automated regression + A/B testing harness, a
+fine-tuning dataset for a real behavior gap found through that harness, a side-by-side AWS Bedrock
+comparison, and real per-request cost tracking (Week 6). The git tags below trace that progression;
+check tag history, not just the latest commit, to see it.
 
-## Status: v1.1 — Week 5 infrastructure complete, Week 6 observability + evaluation underway
+## Status: v1.2 — Week 6 complete, Week 7 multi-agent orchestration underway
 
 The assistant answers questions for **TrailPeak Outdoors**, a fictional outdoor gear retailer.
 Product details and store policies come from RAG over real documents; current price and stock come
@@ -65,6 +66,9 @@ OpenAI API key supplied entirely by AWS Secrets Manager via an IAM task role —
 - A hand-built cost tracking module (`cost/`) — turns every OpenAI call's real token usage into an
   actual dollar figure, logged per pipeline stage, with a hypothetical-cost comparison against a
   pricier model computed from the same token counts (no extra API spend required to see it)
+- LangGraph (`agents/`) — a genuine multi-agent pipeline (Researcher + Writer), separate from the
+  live chat agent entirely: generates customer-facing buying-guide content from the same product
+  catalog, with each role's job kept narrow (facts only vs. prose only) so the split is real
 - A separate, scoped-down AWS Lambda + API Gateway deployment (Mangum), demonstrating a second
   deployment model for `/health` + `/chat` only — see Known gaps below for why the full pipeline
   isn't deployed this way
@@ -131,6 +135,12 @@ OpenAI API key supplied entirely by AWS Secrets Manager via an IAM task role —
                                    same token counts, no extra API call)
              --> logs/cost_log.jsonl (persists across separate runs/processes)
                      --> cost/report.py (aggregate: total, by model, by stage)
+
+  agents/graph.py (StateGraph: researcher -> writer -> END)
+       --> agents/researcher.py (Chroma retrieval -> plain facts only)
+       --> agents/writer.py (facts only -> customer-facing draft)
+       (standalone content-generation pipeline, separate from rag/pipeline.py
+        and the live chat agent entirely - shares only the Chroma collection)
 ```
 
 **`rag/pipeline.py`** — `RAGPipeline` runs a genuine ReAct loop (Day 16's pattern): the model can
@@ -181,6 +191,16 @@ Deliberately **does not implement actual cheap/expensive model routing** — eve
 evidence behind it without ever spending on the pricier model. `report.py` reads the persisted
 `logs/cost_log.jsonl` (not just in-process memory), so cost visibility survives across separate
 CLI/API runs. See Known gaps for what this doesn't cover yet.
+
+**`agents/`** — a genuine multi-agent pipeline (LangGraph `StateGraph`), entirely separate from
+`rag/pipeline.py` and the live `/ask` chat agent. `researcher_node()` retrieves from the same
+Chroma collection the chatbot uses, but is instructed to output plain factual bullet points only -
+no prose, no marketing language. `writer_node()` takes only those facts and drafts a customer-
+facing buying-guide paragraph, never touching the vectorstore directly. The split is enforced by
+each node's own narrow prompt, not by any code-level restriction - confirmed working by testing a
+topic (`"winter camping tents"`) with a known, real content gap (Day 27's finding: no tent in the
+catalog is actually winter-rated) and watching that limitation survive the handoff between both
+agents honestly instead of getting lost or glossed into false copy.
 
 **`core/semantic_cache.py`** — `SemanticCache` checks whether an incoming query is close enough
 (cosine distance over its embedding) to a previously answered query to reuse that answer instead
@@ -251,6 +271,11 @@ production-rag-agent/
 │   │   ├── pricing.py         # per-model USD/1M-token table
 │   │   ├── tracker.py         # records real usage + hypothetical gpt-4o cost
 │   │   └── report.py          # aggregate report from logs/cost_log.jsonl
+│   ├── agents/
+│   │   ├── state.py           # ContentState TypedDict
+│   │   ├── researcher.py      # Chroma retrieval -> plain facts only
+│   │   ├── writer.py          # facts only -> customer-facing draft
+│   │   └── graph.py           # StateGraph: researcher -> writer -> END
 │   └── api/
 │       ├── main.py
 │       └── models.py
@@ -410,6 +435,15 @@ Prints total calls, actual cost, what the same calls would have cost on `gpt-4o`
 breakdown by pipeline stage (`agent_iteration` vs. `final_answer`). Reads `logs/cost_log.jsonl`
 directly, so it works the same whether requests came from `cli.py` or the API.
 
+**11. Run the Researcher + Writer content pipeline** (needs `langgraph`; `pip install langgraph`
+locally, or `docker compose up --build` to pick it up in the container)
+```bash
+docker compose exec app python -m src.agents.graph "winter camping tents"
+```
+Prints the Researcher's raw facts, the sources they came from, and the Writer's final draft.
+Try a topic with a real content gap (as above) and a cleanly-supported one (e.g.
+`"rain jackets"`) to see both the honesty case and the normal case.
+
 ## Known gaps
 
 - **No fine-tuned model exists yet.** The Day 28 dataset (12 examples) is uploaded but the
@@ -498,7 +532,8 @@ directly, so it works the same whether requests came from `cli.py` or the API.
 | `v0.3-week3-frontend` | 3 | SSE streaming frontend, function calling + RAG, eval harness | ✅ |
 | `v1.0-capstone` | 4 | Genuine multi-step agent, deployed on EC2 + ECR + CI/CD, Secrets Manager, IAM roles | ✅ |
 | `v1.1-week5-infra` | 5 | Docker Compose, ECS/Fargate via Terraform, semantic caching (Redis), rate limiting, load testing | ✅ |
-| _(Week 6, in progress)_ | 6 | LangSmith tracing, context precision/recall, regression + A/B testing harness, fine-tuning dataset (prepared, untrained), managed model serving, cost optimization | 🔄 |
+| `v1.2-week6-observability` | 6 | LangSmith tracing, context precision/recall, regression + A/B testing harness, fine-tuning dataset (prepared, untrained), Bedrock comparison, cost tracking | ✅ |
+| _(Week 7, in progress)_ | 7 | LangGraph Researcher + Writer pipeline; Kubernetes/EKS fundamentals, security hardening, monitoring/alerting (rest of week) | 🔄 |
 
 ## Live demo
 
