@@ -69,6 +69,9 @@ OpenAI API key supplied entirely by AWS Secrets Manager via an IAM task role —
 - LangGraph (`agents/`) — a genuine multi-agent pipeline (Researcher + Writer), separate from the
   live chat agent entirely: generates customer-facing buying-guide content from the same product
   catalog, with each role's job kept narrow (facts only vs. prose only) so the split is real
+- Kubernetes (`infra/k8s/`) — the same three-container shape (`app`, `chroma`, `redis`) as
+  Compose/ECS, redefined as Deployments + Services, run locally via Minikube; a Kubernetes Secret
+  supplies the OpenAI key in place of ECS's Secrets Manager injection
 - A separate, scoped-down AWS Lambda + API Gateway deployment (Mangum), demonstrating a second
   deployment model for `/health` + `/chat` only — see Known gaps below for why the full pipeline
   isn't deployed this way
@@ -141,6 +144,13 @@ OpenAI API key supplied entirely by AWS Secrets Manager via an IAM task role —
        --> agents/writer.py (facts only -> customer-facing draft)
        (standalone content-generation pipeline, separate from rag/pipeline.py
         and the live chat agent entirely - shares only the Chroma collection)
+
+  infra/k8s/*.yaml (app, chroma, redis - Deployment + Service each)
+       --> Minikube (local single-node cluster)
+       (same three-container shape as docker-compose.yml / ecs.tf, third
+        environment's answer to service discovery: Kubernetes Service DNS
+        names ("chroma", "redis") rather than Compose's built-in DNS or
+        ECS's shared-network-interface "localhost")
 ```
 
 **`rag/pipeline.py`** — `RAGPipeline` runs a genuine ReAct loop (Day 16's pattern): the model can
@@ -282,7 +292,11 @@ production-rag-agent/
 ├── frontend/
 │   └── index.html
 ├── infra/
-│   ├── Dockerfile
+│   ├── Dockerfile           # now also COPYs data/ - see Known gaps
+│   ├── k8s/
+│   │   ├── redis.yaml
+│   │   ├── chroma.yaml
+│   │   └── app.yaml         # CHROMA_HOST/REDIS_HOST as Service DNS names; openai-secret via secretKeyRef
 │   ├── lambda/
 │   │   └── lambda_app.py
 │   └── terraform/
@@ -446,6 +460,13 @@ Try a topic with a real content gap (as above) and a cleanly-supported one (e.g.
 
 ## Known gaps
 
+- **`infra/Dockerfile` never copied `data/` into the image at all until Day 32** — only ever
+  masked by `docker-compose.yml`'s bind mount, which meant the image itself has never really been
+  self-contained. Surfaced because Kubernetes Pods have no equivalent to a host bind mount (see
+  Day 32 notes). Fixed with `COPY data/ ./data/` alongside the existing `COPY src/ ./src/`. **Open
+  question, not yet checked**: since this exact Dockerfile also builds the production ECS image,
+  it's worth confirming whether that deployment has had the same latent gap this whole time, and if
+  so, how ingestion there has actually been succeeding.
 - **No fine-tuned model exists yet.** The Day 28 dataset (12 examples) is uploaded but the
   training job was deliberately never submitted — training is charged per token (multiplied by
   epochs, default 3) and the resulting model costs more per token at inference, ongoing. A
@@ -533,7 +554,7 @@ Try a topic with a real content gap (as above) and a cleanly-supported one (e.g.
 | `v1.0-capstone` | 4 | Genuine multi-step agent, deployed on EC2 + ECR + CI/CD, Secrets Manager, IAM roles | ✅ |
 | `v1.1-week5-infra` | 5 | Docker Compose, ECS/Fargate via Terraform, semantic caching (Redis), rate limiting, load testing | ✅ |
 | `v1.2-week6-observability` | 6 | LangSmith tracing, context precision/recall, regression + A/B testing harness, fine-tuning dataset (prepared, untrained), Bedrock comparison, cost tracking | ✅ |
-| _(Week 7, in progress)_ | 7 | LangGraph Researcher + Writer pipeline; Kubernetes/EKS fundamentals, security hardening, monitoring/alerting (rest of week) | 🔄 |
+| _(Week 7, in progress)_ | 7 | LangGraph Researcher + Writer pipeline; Kubernetes fundamentals + local Minikube deployment (self-healing demonstrated live); EKS, security hardening, monitoring/alerting (rest of week) | 🔄 |
 
 ## Live demo
 
