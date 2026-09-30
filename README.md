@@ -460,6 +460,12 @@ Try a topic with a real content gap (as above) and a cleanly-supported one (e.g.
 
 ## Known gaps
 
+- **No EKS cluster has actually been deployed yet.** Day 33 covered EKS fundamentals (managed
+  control plane vs. node groups, IAM-for-ECR image pulls, `LoadBalancer` Services, the cost model)
+  as a deliberate conceptual walkthrough rather than a live create/test/destroy cycle, since Day 32
+  already covered the underlying Kubernetes concepts hands-on for free. The exact `eksctl` command
+  sequence is recorded in `day-33-notes.md` for whenever a real EKS deployment is actually needed
+  (likely the Week 7 Saturday project or Week 8 capstone infra work).
 - **`infra/Dockerfile` never copied `data/` into the image at all until Day 32** — only ever
   masked by `docker-compose.yml`'s bind mount, which meant the image itself has never really been
   self-contained. Surfaced because Kubernetes Pods have no equivalent to a host bind mount (see
@@ -554,7 +560,7 @@ Try a topic with a real content gap (as above) and a cleanly-supported one (e.g.
 | `v1.0-capstone` | 4 | Genuine multi-step agent, deployed on EC2 + ECR + CI/CD, Secrets Manager, IAM roles | ✅ |
 | `v1.1-week5-infra` | 5 | Docker Compose, ECS/Fargate via Terraform, semantic caching (Redis), rate limiting, load testing | ✅ |
 | `v1.2-week6-observability` | 6 | LangSmith tracing, context precision/recall, regression + A/B testing harness, fine-tuning dataset (prepared, untrained), Bedrock comparison, cost tracking | ✅ |
-| _(Week 7, in progress)_ | 7 | LangGraph Researcher + Writer pipeline; Kubernetes fundamentals + local Minikube deployment (self-healing demonstrated live); EKS, security hardening, monitoring/alerting (rest of week) | 🔄 |
+| _(Week 7, in progress)_ | 7 | LangGraph Researcher + Writer pipeline; Kubernetes fundamentals + local Minikube deployment (self-healing demonstrated live); EKS fundamentals (conceptual); security hardening, monitoring/alerting (rest of week) | 🔄 |
 
 ## Live demo
 
