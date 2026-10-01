@@ -9,7 +9,7 @@ from src.core.embeddings import get_embedding
 from src.core.vectorstore import get_collection
 from src.tools.inventory_tool import TOOL_SCHEMA as AVAILABILITY_SCHEMA, TOOL_FUNCTION as AVAILABILITY_FUNCTION
 from src.tools.calculator_tool import TOOL_SCHEMA as CALC_SCHEMA, TOOL_FUNCTION as CALC_FUNCTION
-from src.rag.prompts import build_answer_prompt, FINAL_ANSWER_INSTRUCTION
+from src.rag.prompts import build_answer_prompt, FINAL_ANSWER_INSTRUCTION, SYSTEM_PROMPT
 from src.core.semantic_cache import SemanticCache
 from src.cost.tracker import cost_tracker
 
@@ -108,7 +108,10 @@ class RAGPipeline:
                 "from_cache": False
             }
 
-        messages = [{"role": "user", "content": build_answer_prompt(query, chunks, sources)}]
+        messages = [
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": build_answer_prompt(query, chunks, sources)}
+        ]
         messages, tool_context_parts, hit_cap = self._run_agent_loop(messages)
 
         full_context = "\n\n".join(chunks)
@@ -157,7 +160,10 @@ class RAGPipeline:
 
         yield f"event: sources\ndata: {json.dumps(list(set(sources)))}\n\n"
 
-        messages = [{"role": "user", "content": build_answer_prompt(query, chunks, sources)}]
+        messages = [
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": build_answer_prompt(query, chunks, sources)}
+        ]
         messages, tool_context_parts, hit_cap = self._run_agent_loop(messages)
 
         full_context = "\n\n".join(chunks)

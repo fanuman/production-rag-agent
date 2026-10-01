@@ -1,7 +1,15 @@
-from pydantic import BaseModel
+from pydantic import BaseModel, Field, field_validator
 
 class ChatRequest(BaseModel):
-    message: str
+    message: str = Field(..., min_length=1, max_length=2000)
+
+    @field_validator("message")
+    @classmethod
+    def not_blank(cls, v: str) -> str:
+        v = v.strip()
+        if not v:
+            raise ValueError("message cannot be blank or whitespace-only")
+        return v
 
 class ChatResponse(BaseModel):
     reply: str
@@ -13,7 +21,15 @@ class ChatMetaData(BaseModel):
     total_cost: float
 
 class RagRequest(BaseModel):
-    message: str
+    message: str = Field(..., min_length=1, max_length=2000)
+
+    @field_validator("message")
+    @classmethod
+    def not_blank(cls, v: str) -> str:
+        v = v.strip()
+        if not v:
+            raise ValueError("message cannot be blank or whitespace-only")
+        return v
 
 class RagResponse(BaseModel):
     reply: str
