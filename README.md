@@ -77,6 +77,10 @@ OpenAI API key supplied entirely by AWS Secrets Manager via an IAM task role —
   absent entirely) explicitly framing retrieved context as untrusted data rather than instructions,
   and a documented zero-new-code key rotation runbook built on the existing ECS task-replacement
   mechanism
+- CloudWatch monitoring (`infra/terraform/monitoring.tf`) — a log metric filter turning the Day 34
+  Secrets Manager fallback warning into a real, alertable metric, CPU/memory health alarms on the
+  ECS service, an SNS email channel, and a combined dashboard - validated with a real fire drill
+  (a deliberately corrupted secret), not just a `terraform apply`
 - A separate, scoped-down AWS Lambda + API Gateway deployment (Mangum), demonstrating a second
   deployment model for `/health` + `/chat` only — see Known gaps below for why the full pipeline
   isn't deployed this way
@@ -310,7 +314,8 @@ production-rag-agent/
 │       ├── iam.tf
 │       ├── variables.tf
 │       ├── ecs.tf
-│       └── terraform.tfvars    # gitignored - personal IP, not committed
+│       ├── monitoring.tf       # SNS topic, log metric filter, CPU/memory + secret-fallback alarms, dashboard
+│       └── terraform.tfvars    # gitignored - personal IP + alert email, not committed
 ├── data/                    # original source documents - committed, not gitignored
 ├── chroma_db/               # persisted index - gitignored, rebuilt from source every time
 ├── logs/                    # cost_log.jsonl - gitignored, generated locally
@@ -465,6 +470,17 @@ Try a topic with a real content gap (as above) and a cleanly-supported one (e.g.
 
 ## Known gaps
 
+- **ECS rolling deployments behave less predictably without a health check or load balancer.**
+  Found live during Day 35's monitoring fire drill: during a `force-new-deployment`, which task ECS
+  chooses to retain during scale-down back to `desiredCount: 1` isn't fully predictable - an
+  already-established task survived through two separate forced redeployments before eventually
+  being replaced on its own timeline, while newer tasks came and went around it. Didn't cause any
+  actual downtime (a healthy task was always serving), but made it harder to be certain which task
+  a given test request actually hit - direct CloudWatch Logs queries were the reliable way to verify,
+  not `curl` alone. A real health check would make this predictable; not added today.
+- **CPU/memory alarm thresholds (80% for 2 minutes) are reasonable defaults, not calibrated** -
+  never actually tested under real load (a Locust run would be the way to check whether they trigger
+  sensibly in practice).
 - **API key rotation runbook** (no code change needed - `secrets.py` already fetches the key from
   Secrets Manager at app startup, so task replacement already re-fetches fresh secrets):
   1. Generate a new key on platform.openai.com
@@ -575,7 +591,7 @@ Try a topic with a real content gap (as above) and a cleanly-supported one (e.g.
 | `v1.0-capstone` | 4 | Genuine multi-step agent, deployed on EC2 + ECR + CI/CD, Secrets Manager, IAM roles | ✅ |
 | `v1.1-week5-infra` | 5 | Docker Compose, ECS/Fargate via Terraform, semantic caching (Redis), rate limiting, load testing | ✅ |
 | `v1.2-week6-observability` | 6 | LangSmith tracing, context precision/recall, regression + A/B testing harness, fine-tuning dataset (prepared, untrained), Bedrock comparison, cost tracking | ✅ |
-| _(Week 7, in progress)_ | 7 | LangGraph Researcher + Writer pipeline; Kubernetes fundamentals + local Minikube deployment (self-healing demonstrated live); EKS fundamentals (conceptual); input validation + prompt-injection hardening + key rotation runbook; monitoring/alerting (rest of week) | 🔄 |
+| _(Week 7, weekdays complete)_ | 7 | LangGraph Researcher + Writer pipeline; Kubernetes fundamentals + local Minikube deployment (self-healing demonstrated live); EKS fundamentals (conceptual); input validation + prompt-injection hardening + key rotation runbook; CloudWatch monitoring + alerting (SNS, metric filters, alarms, dashboard - validated with a real fire drill). Saturday project (orchestrator/specialist router + EKS deployment) still pending | 🔄 |
 
 ## Live demo
 
