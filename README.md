@@ -13,10 +13,13 @@ multi-container local dev, Redis-backed caching and rate limiting, and a Terrafo
 ECS/Fargate deployment replacing hand-clicked console setup (Week 5), then gained LangSmith
 tracing, context precision/recall metrics, an automated regression + A/B testing harness, a
 fine-tuning dataset for a real behavior gap found through that harness, a side-by-side AWS Bedrock
-comparison, and real per-request cost tracking (Week 6). The git tags below trace that progression;
-check tag history, not just the latest commit, to see it.
+comparison, and real per-request cost tracking (Week 6), then gained a second multi-agent topology
+(a genuine LangGraph Researcher + Writer pipeline), Kubernetes fundamentals demonstrated live on
+Minikube, real security hardening (input validation, prompt-injection defenses, a key rotation
+runbook), and a full CloudWatch monitoring/alerting stack validated with a real fire drill (Week 7).
+The git tags below trace that progression; check tag history, not just the latest commit, to see it.
 
-## Status: v1.2 — Week 6 complete, Week 7 multi-agent orchestration underway
+## Status: v1.3 — Week 7 complete, Week 8 capstone next
 
 The assistant answers questions for **TrailPeak Outdoors**, a fictional outdoor gear retailer.
 Product details and store policies come from RAG over real documents; current price and stock come
@@ -491,12 +494,24 @@ Try a topic with a real content gap (as above) and a cleanly-supported one (e.g.
     the environment on a Secrets Manager failure, only logging a warning - during a rotation
     specifically, a task could keep running on a stale/missing key with nothing actually alerting
     on it. Natural fit for a CloudWatch alarm (Day 35), not fixed today.
-- **No EKS cluster has actually been deployed yet.** Day 33 covered EKS fundamentals (managed
-  control plane vs. node groups, IAM-for-ECR image pulls, `LoadBalancer` Services, the cost model)
-  as a deliberate conceptual walkthrough rather than a live create/test/destroy cycle, since Day 32
-  already covered the underlying Kubernetes concepts hands-on for free. The exact `eksctl` command
-  sequence is recorded in `day-33-notes.md` for whenever a real EKS deployment is actually needed
-  (likely the Week 7 Saturday project or Week 8 capstone infra work).
+- **No EKS cluster has actually been deployed yet - deferred twice, deliberately.** Day 33 covered
+  EKS fundamentals (managed control plane vs. node groups, IAM-for-ECR image pulls, `LoadBalancer`
+  Services, the cost model) as a conceptual walkthrough rather than a live create/test/destroy
+  cycle, since Day 32 already covered the underlying Kubernetes concepts hands-on for free. The
+  Week 7 Saturday project revisited this and deferred it a second time: standing up a real cluster
+  only to tear it back down minutes later (nothing from Week 7's work would persist on it) would add
+  AWS spend and session time without teaching anything Day 33 doesn't already have in writing. The
+  exact `eksctl` command sequence is recorded in `day-33-notes.md` for whenever a real EKS
+  deployment is actually needed - most plausibly Week 8 capstone infra work, where something would
+  actually stay deployed for longer than a single session.
+- **The orchestrator/specialist router pattern is documented, not built.** Week 7's Saturday
+  project originally planned this as a second hands-on LangGraph exercise on top of Day 31's
+  pipeline. Deliberately deferred instead: Week 8's capstone already commits to LangGraph as a core
+  tool from day one, which is where conditional-edge routing gets real, sustained practice - a
+  second lighter exercise today to touch the same primitive once would be duplicated effort.
+  `day-31-notes.md` carries the full concept (router vs. pipeline, what `add_conditional_edges`
+  formalizes) plus a plain `if`/`elif`/`else` implementation of the same dispatch logic, so the idea
+  is precise and ready when Week 8 needs it.
 - **`infra/Dockerfile` never copied `data/` into the image at all until Day 32** — only ever
   masked by `docker-compose.yml`'s bind mount, which meant the image itself has never really been
   self-contained. Surfaced because Kubernetes Pods have no equivalent to a host bind mount (see
@@ -591,7 +606,7 @@ Try a topic with a real content gap (as above) and a cleanly-supported one (e.g.
 | `v1.0-capstone` | 4 | Genuine multi-step agent, deployed on EC2 + ECR + CI/CD, Secrets Manager, IAM roles | ✅ |
 | `v1.1-week5-infra` | 5 | Docker Compose, ECS/Fargate via Terraform, semantic caching (Redis), rate limiting, load testing | ✅ |
 | `v1.2-week6-observability` | 6 | LangSmith tracing, context precision/recall, regression + A/B testing harness, fine-tuning dataset (prepared, untrained), Bedrock comparison, cost tracking | ✅ |
-| _(Week 7, weekdays complete)_ | 7 | LangGraph Researcher + Writer pipeline; Kubernetes fundamentals + local Minikube deployment (self-healing demonstrated live); EKS fundamentals (conceptual); input validation + prompt-injection hardening + key rotation runbook; CloudWatch monitoring + alerting (SNS, metric filters, alarms, dashboard - validated with a real fire drill). Saturday project (orchestrator/specialist router + EKS deployment) still pending | 🔄 |
+| `v1.3-week7-hardening` | 7 | LangGraph Researcher + Writer pipeline; Kubernetes fundamentals + local Minikube deployment (self-healing demonstrated live); EKS fundamentals (conceptual, deliberately deferred twice); input validation + prompt-injection hardening + key rotation runbook; CloudWatch monitoring + alerting (SNS, metric filters, alarms, dashboard - validated with a real fire drill). Saturday project: orchestrator/specialist router pattern documented (not built, deferred to Week 8) | ✅ |
 
 ## Live demo
 
