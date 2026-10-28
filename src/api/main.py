@@ -13,6 +13,7 @@ from src.api.models import ChatRequest, ChatResponse, ChatMetaData, RagRequest, 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
+from fastapi.staticfiles import StaticFiles
 
 from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.util import get_remote_address
@@ -21,8 +22,11 @@ from slowapi.middleware import SlowAPIMiddleware
 from fastapi import Request
 
 import os
+import logging
+from pathlib import Path
 
 REDIS_HOST = os.getenv("REDIS_HOST", "redis")
+logger = logging.getLogger(__name__)
 
 llm_client = None
 rag_pipeline = None
@@ -42,7 +46,11 @@ app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
 app.add_middleware(SlowAPIMiddleware)
-app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
+# The UI is served by this app (same origin), so no CORS is needed by default.
+# Only if you host the UI somewhere else: CORS_ORIGINS="https://my-ui.example.com,http://localhost:5173"
+CORS_ORIGINS = [o.strip() for o in os.getenv("CORS_ORIGINS", "").split(",") if o.strip()]
+if CORS_ORIGINS:
+    app.add_middleware(CORSMiddleware, allow_origins=CORS_ORIGINS, allow_methods=["*"], allow_headers=["*"])
 
 
 @app.get("/health")
@@ -68,8 +76,9 @@ def chat(request: Request, chat_request: ChatRequest):
             reply=response.choices[0].message.content,
             total_cost=llm_client.total_cost
         )
-    except Exception as error:
-        raise HTTPException(status_code=502, detail=str(error))
+    except Exception:
+        logger.exception("/chat failed")
+        raise HTTPException(status_code=502, detail="Upstream error. Please try again.")
 
 
 @app.get("/cost", response_model=ChatMetaData)
@@ -92,11 +101,23 @@ def ask(request: Request, rag_request: RagRequest):
             used_fallback=result["used_fallback"],
             from_cache=result["from_cache"],
         )
-    except Exception as error:
-        raise HTTPException(status_code=502, detail=str(error))
+    except Exception:
+        logger.exception("/ask failed")
+        raise HTTPException(status_code=502, detail="Upstream error. Please try again.")
 
 
 @app.post("/ask/stream")
 @limiter.limit("10/minute")
 def ask_stream(request: Request, rag_request: RagRequest):
-    return StreamingResponse(rag_pipeline.answer_stream(rag_request.message), media_type="text/event-stream")
+    return StreamingResponse(
+        rag_pipeline.answer_stream(rag_request.message),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},  # stop proxies from buffering the stream
+    )
+
+
+# Serve the web UI from this same app. Must stay LAST: a mount at "/" matches every path,
+# so every API route above has to be registered before it.
+FRONTEND_DIR = Path(__file__).resolve().parents[2] / "frontend"   # /app/frontend inside Docker
+if FRONTEND_DIR.is_dir():
+    app.mount("/", StaticFiles(directory=FRONTEND_DIR, html=True), name="frontend")

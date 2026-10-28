@@ -26,6 +26,15 @@ def check_availability(sku: str) -> str:
     )
 
 
+def get_product(sku: str):
+    """Same lookup as check_availability, but returns data instead of a sentence,
+    so the UI can draw a product card from it."""
+    product = INVENTORY.get(sku.upper())
+    if not product:
+        return None
+    return {"sku": sku.upper(), **product}
+
+
 # Self-registration - rag/pipeline.py aggregates these rather than hand-
 # assembling a tools list itself. A new tool file following this same
 # TOOL_SCHEMA/TOOL_FUNCTION pattern is all that's needed to be picked up -

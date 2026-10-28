@@ -1,5 +1,6 @@
 # src/rag/pipeline.py
 import json
+import logging
 from openai import OpenAI
 from pydantic import BaseModel
 from typing import List
@@ -7,13 +8,37 @@ from typing import List
 from src.core.config import DEFAULT_MODEL, RELEVANCE_THRESHOLD, RETRIEVAL_K
 from src.core.embeddings import get_embedding
 from src.core.vectorstore import get_collection
-from src.tools.inventory_tool import TOOL_SCHEMA as AVAILABILITY_SCHEMA, TOOL_FUNCTION as AVAILABILITY_FUNCTION
+from src.tools.inventory_tool import TOOL_SCHEMA as AVAILABILITY_SCHEMA, TOOL_FUNCTION as AVAILABILITY_FUNCTION, get_product
 from src.tools.calculator_tool import TOOL_SCHEMA as CALC_SCHEMA, TOOL_FUNCTION as CALC_FUNCTION
 from src.rag.prompts import build_answer_prompt, FINAL_ANSWER_INSTRUCTION, SYSTEM_PROMPT
 from src.core.semantic_cache import SemanticCache
 from src.cost.tracker import cost_tracker
 
 from langsmith import traceable
+
+logger = logging.getLogger(__name__)
+
+# tool name -> (label while running, label when finished), for the trail the UI shows
+TOOL_LABELS = {
+    "CheckAvailability": ("Checking live stock", "Checked live stock"),
+    "CalculateTotal": ("Adding the prices", "Added the prices"),
+}
+
+
+def sse(event, data):
+    """One Server-Sent Event. The payload is JSON, so a newline inside a token
+    can never break the event framing."""
+    return f"event: {event}\ndata: {json.dumps(data)}\n\n"
+
+
+def _tool_step(event, status):
+    running, finished = TOOL_LABELS.get(event["name"], (event["name"], event["name"]))
+    if event["name"] == "CheckAvailability":
+        detail = event["args"].get("sku", "")
+    else:
+        detail = event.get("result", "") if status == "done" else ""
+    return {"id": event["id"], "label": running if status == "running" else finished,
+            "detail": detail, "status": status}
 
 
 class FinalAnswer(BaseModel):
@@ -49,14 +74,16 @@ class RAGPipeline:
     def _is_out_of_scope(self, distances):
         return all(d >= self.relevance_threshold for d in distances)
 
-    @traceable(name="agent_loop")
-    def _run_agent_loop(self, messages):
-        """ReAct loop (Day 16): keep letting the model act and observe
-        until it stops requesting tools, or hit max_iterations as a
+    def _agent_events(self, messages):
+        """ReAct loop (Day 16) as a generator: keep letting the model act and
+        observe until it stops requesting tools, or hit max_iterations as a
         safety guard against a runaway/non-progressing loop. Only turns
         that involved a real tool call get appended - a final "no more
         tools needed" turn is discarded, since the follow-up structured
-        answer call re-derives the response fresh anyway."""
+        answer call re-derives the response fresh anyway.
+
+        Yields a tool_start / tool_done event around every tool call so a
+        caller can show progress live, then one last "finished" event."""
         tool_context_parts = []
         for _ in range(self.max_iterations):
             response = self.client.chat.completions.create(
@@ -71,16 +98,29 @@ class RAGPipeline:
             response_message = response.choices[0].message
 
             if not response_message.tool_calls:
-                return messages, tool_context_parts, False
+                yield {"type": "finished", "tool_context_parts": tool_context_parts, "hit_cap": False}
+                return
 
             messages.append(response_message)
             for tool_call in response_message.tool_calls:
+                name = tool_call.function.name
                 args = json.loads(tool_call.function.arguments)
-                result = self.available_functions[tool_call.function.name](**args)
+                yield {"type": "tool_start", "id": tool_call.id, "name": name, "args": args}
+                result = self.available_functions[name](**args)
                 tool_context_parts.append(result)
                 messages.append({"role": "tool", "tool_call_id": tool_call.id, "content": result})
+                yield {"type": "tool_done", "id": tool_call.id, "name": name, "args": args, "result": result}
 
-        return messages, tool_context_parts, True  # hit the cap without a final answer
+        # hit the cap without a final answer
+        yield {"type": "finished", "tool_context_parts": tool_context_parts, "hit_cap": True}
+
+    @traceable(name="agent_loop")
+    def _run_agent_loop(self, messages):
+        """Non-streaming callers only want the end state, so run the generator
+        to its final event and return the same triple as before."""
+        for event in self._agent_events(messages):
+            if event["type"] == "finished":
+                return messages, event["tool_context_parts"], event["hit_cap"]
 
     @traceable(name="rag_answer")
     def answer(self, query, k=None):
@@ -141,48 +181,82 @@ class RAGPipeline:
                 "used_fallback": False, "full_context": full_context, "from_cache": False}
 
     def answer_stream(self, query, k=None):
+        """Yields Server-Sent Events with JSON payloads:
+          step    - one line of the trail the UI shows: {id, label, detail, status}
+          product - a live inventory result, drawn as a card: {sku, name, price, stock, sizes}
+          token   - a piece of the answer text: {t}
+          done    - last event on success: {sources, cached, fallback}
+          error   - something failed, the stream ends: {message}
+        """
+        try:
+            yield from self._stream_events(query, k)
+        except Exception:
+            logger.exception("answer_stream failed")
+            yield sse("error", {"message": "Something went wrong while answering. Please try again."})
+
+    def _stream_events(self, query, k=None):
+        yield sse("step", {"id": "search", "label": "Searching store documents", "detail": "", "status": "running"})
         query_embedding = get_embedding(query)
 
         cached = self.cache.check(query_embedding=query_embedding) if self.use_cache else None
         if cached:
-            yield f"event: sources\ndata: {json.dumps([])}\n\n"
-            yield f"data: {cached['response']}\n\n"
-            yield "data: [DONE]\n\n"
+            text = cached["response"]
+            if isinstance(text, bytes):
+                text = text.decode()
+            yield sse("step", {"id": "search", "label": "Found a saved answer", "detail": "", "status": "done"})
+            yield sse("token", {"t": text})
+            yield sse("done", {"sources": [], "cached": True, "fallback": False})
             return
 
         chunks, sources, distances = self.retrieve(query_embedding, k=k)
 
         if self._is_out_of_scope(distances):
-            yield f"event: sources\ndata: {json.dumps([])}\n\n"
-            yield f"data: {self.FALLBACK_MESSAGE}\n\n"
-            yield "data: [DONE]\n\n"
+            yield sse("step", {"id": "search", "label": "Searched store documents", "detail": "no close match", "status": "done"})
+            yield sse("token", {"t": self.FALLBACK_MESSAGE})
+            yield sse("done", {"sources": [], "cached": False, "fallback": True})
             return
 
-        yield f"event: sources\ndata: {json.dumps(list(set(sources)))}\n\n"
+        unique_sources = list(dict.fromkeys(sources))
+        yield sse("step", {"id": "search", "label": "Searched store documents", "detail": ", ".join(unique_sources), "status": "done"})
 
         messages = [
             {"role": "system", "content": SYSTEM_PROMPT},
             {"role": "user", "content": build_answer_prompt(query, chunks, sources)}
         ]
-        messages, tool_context_parts, hit_cap = self._run_agent_loop(messages)
+
+        tool_context_parts, hit_cap = [], False
+        for event in self._agent_events(messages):
+            if event["type"] == "tool_start":
+                yield sse("step", _tool_step(event, "running"))
+            elif event["type"] == "tool_done":
+                yield sse("step", _tool_step(event, "done"))
+                if event["name"] == "CheckAvailability":
+                    product = get_product(event["args"].get("sku", ""))
+                    if product:
+                        yield sse("product", product)
+            else:  # "finished"
+                tool_context_parts, hit_cap = event["tool_context_parts"], event["hit_cap"]
 
         full_context = "\n\n".join(chunks)
         if tool_context_parts:
             full_context += "\n\n" + "\n\n".join(tool_context_parts)
 
         if hit_cap:
-            yield "data: I wasn't able to fully work through this request - it may need to be broken into simpler questions.\n\n"
-            yield "data: [DONE]\n\n"
+            yield sse("token", {"t": "I wasn't able to fully work through this request - it may need to be broken into simpler questions."})
+            yield sse("done", {"sources": unique_sources, "cached": False, "fallback": True})
             return
 
         full_reply = ""
-        stream = self.client.chat.completions.create(model=self.model, messages=messages, stream=True)
+        stream = self.client.chat.completions.create(
+            model=self.model, messages=messages, stream=True,
+            stream_options={"include_usage": True},  # without this, chunk.usage is always empty and no cost is logged
+        )
         for chunk in stream:
             if chunk.choices:
                 delta = chunk.choices[0].delta.content
                 if delta:
                     full_reply += delta
-                    yield f"data: {delta}\n\n"
+                    yield sse("token", {"t": delta})
             if chunk.usage:
                 cost_tracker.record(
                     model=self.model,
@@ -194,4 +268,4 @@ class RAGPipeline:
         if not tool_context_parts and self.use_cache:
             self.cache.store(query, full_reply, query_embedding, full_context)
 
-        yield "data: [DONE]\n\n"
+        yield sse("done", {"sources": unique_sources, "cached": False, "fallback": False})
