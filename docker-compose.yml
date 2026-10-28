@@ -17,6 +17,7 @@ services:
     volumes:
       - ./src:/app/src
       - ./data:/app/data
+      - ./frontend:/app/frontend
       - ./logs:/app/logs
 
   chroma:
