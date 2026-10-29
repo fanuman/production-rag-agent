@@ -1,36 +1,27 @@
-"""Tests for the streaming event protocol (src/rag/pipeline.py: sse and answer_stream).
+"""Tests for the pipeline (src/rag/pipeline.py): the live events from answer_stream()
+and the finished dict from answer().
 
 No network, no Redis, no Chroma: OpenAI, the semantic cache, the vector store, the
 embedding call and the cost log are all replaced by tiny fakes, so these run anywhere
 (including CI) in well under a second.
 """
-import json
 import os
 from types import SimpleNamespace
 
 os.environ.setdefault("OPENAI_API_KEY", "sk-test-dummy-key-for-unit-tests")
 
 from src.rag import pipeline as pl  # noqa: E402
-from src.rag.pipeline import RAGPipeline, sse  # noqa: E402
+from src.rag.pipeline import RAGPipeline  # noqa: E402
 
 
 # ---------- helpers -------------------------------------------------------------
 
-def parse(raw_events):
-    """Turn raw SSE text back into [(event_name, payload), ...] the way the browser does."""
-    events = []
-    for block in "".join(raw_events).split("\n\n"):
-        if not block:
-            continue
-        lines = block.split("\n")
-        name = lines[0].removeprefix("event: ")
-        payload = json.loads("".join(line.removeprefix("data: ") for line in lines[1:]))
-        events.append((name, payload))
-    return events
-
-
 def reply_text(events):
-    return "".join(p["t"] for name, p in events if name == "token")
+    return "".join(data["t"] for name, data in events if name == "token")
+
+
+def names(events):
+    return [name for name, _ in events]
 
 
 class FakeCache:
@@ -53,44 +44,60 @@ class FakeCosts:
         self.labels.append(label)
 
 
-def completion(tool_calls=None):
-    return SimpleNamespace(
-        usage=SimpleNamespace(prompt_tokens=1, completion_tokens=1),
-        choices=[SimpleNamespace(message=SimpleNamespace(tool_calls=tool_calls))],
-    )
-
-
 def tool_call(name="CheckAvailability", arguments='{"sku": "TP-PCK-003"}', call_id="call_1"):
     return SimpleNamespace(id=call_id, function=SimpleNamespace(name=name, arguments=arguments))
 
 
 class FakeOpenAI:
-    """Agent-loop calls return `tool_calls` the first time (or every time if always_tools),
-    then a plain message. Streaming calls return the pieces in `stream_text`."""
+    """Every model call in the loop is streamed. While `tool_calls` are configured, the first
+    call is a "tool turn" (the requests arrive in pieces, like the real API; every call if
+    always_tools) and any other call is a text turn that streams `stream_text`.
+    `parse` is the structured-output call that answer() makes at the end."""
 
     def __init__(self, tool_calls=None, always_tools=False, stream_text=("Hello", " world")):
         self.tool_calls = tool_calls
         self.always_tools = always_tools
         self.stream_text = stream_text
-        self.calls = []
-        self.chat = SimpleNamespace(completions=SimpleNamespace(create=self._create))
+        self.calls = []         # streamed calls
+        self.parse_calls = []   # structured-output calls
+        self.chat = SimpleNamespace(completions=SimpleNamespace(create=self._create, parse=self._parse))
 
     def _create(self, **kwargs):
         self.calls.append(kwargs)
-        if kwargs.get("stream"):
-            chunks = [
-                SimpleNamespace(choices=[SimpleNamespace(delta=SimpleNamespace(content=t))], usage=None)
-                for t in self.stream_text
-            ]
-            chunks.append(SimpleNamespace(choices=[], usage=SimpleNamespace(prompt_tokens=10, completion_tokens=5)))
-            return iter(chunks)
-        agent_calls = [c for c in self.calls if not c.get("stream")]
-        if self.tool_calls and (self.always_tools or len(agent_calls) == 1):
-            return completion(self.tool_calls)
-        return completion(None)
+        if self.tool_calls and (self.always_tools or len(self.calls) == 1):
+            return iter(self._tool_chunks())
+        return iter(self._text_chunks())
+
+    def _parse(self, **kwargs):
+        self.parse_calls.append(kwargs)
+        parsed = SimpleNamespace(answer="Structured answer", sources_used=["returns_policy.txt"])
+        return SimpleNamespace(usage=SimpleNamespace(prompt_tokens=7, completion_tokens=3),
+                               choices=[SimpleNamespace(message=SimpleNamespace(parsed=parsed))])
+
+    @staticmethod
+    def _chunk(content=None, tool_pieces=None):
+        delta = SimpleNamespace(content=content, tool_calls=tool_pieces)
+        return SimpleNamespace(choices=[SimpleNamespace(delta=delta)], usage=None)
+
+    @staticmethod
+    def _usage_chunk():
+        return SimpleNamespace(choices=[], usage=SimpleNamespace(prompt_tokens=10, completion_tokens=5))
+
+    def _text_chunks(self):
+        return [self._chunk(content=t) for t in self.stream_text] + [self._usage_chunk()]
+
+    def _tool_chunks(self):
+        chunks = []
+        for i, tc in enumerate(self.tool_calls):
+            args = tc.function.arguments
+            half = len(args) // 2   # the JSON arguments arrive in two pieces
+            first = SimpleNamespace(index=i, id=tc.id, function=SimpleNamespace(name=tc.function.name, arguments=args[:half]))
+            second = SimpleNamespace(index=i, id=None, function=SimpleNamespace(name=None, arguments=args[half:]))
+            chunks += [self._chunk(tool_pieces=[first]), self._chunk(tool_pieces=[second])]
+        return chunks + [self._usage_chunk()]
 
 
-def make_pipeline(monkeypatch, cache_hit=None, distances=(0.2,), **openai_kwargs):
+def make_pipeline(monkeypatch, cache_hit=None, distances=(0.2,), pipeline_kwargs=None, **openai_kwargs):
     client = FakeOpenAI(**openai_kwargs)
     cache = FakeCache(cache_hit)
     costs = FakeCosts()
@@ -105,70 +112,78 @@ def make_pipeline(monkeypatch, cache_hit=None, distances=(0.2,), **openai_kwargs
     monkeypatch.setattr(pl, "get_embedding", lambda text: [0.0])
     monkeypatch.setattr(pl, "get_collection", lambda: collection)
     monkeypatch.setattr(pl, "cost_tracker", costs)
-    return RAGPipeline(), client, cache, costs
+    return RAGPipeline(**(pipeline_kwargs or {})), client, cache, costs
 
 
-# ---------- the wire format -----------------------------------------------------
-
-def test_sse_keeps_newlines_inside_one_event():
-    raw = sse("token", {"t": "- one\n- two\n\nthree"})
-    assert raw.count("\n\n") == 1 and raw.endswith("\n\n")  # exactly one event terminator
-    assert parse([raw]) == [("token", {"t": "- one\n- two\n\nthree"})]
-
-
-# ---------- answer_stream -------------------------------------------------------
+# ---------- answer_stream: the live events --------------------------------------
 
 def test_plain_answer_streams_steps_tokens_and_done(monkeypatch):
     p, client, cache, costs = make_pipeline(monkeypatch)
-    events = parse(p.answer_stream("What is your return policy?"))
+    events = list(p.answer_stream("What is your return policy?"))
 
-    names = [n for n, _ in events]
-    assert names[0] == "step" and names[-1] == "done"
+    assert names(events)[0] == "step" and names(events)[-1] == "done"
     assert events[0][1]["status"] == "running"
-    assert events[1][1] == {"id": "search", "label": "Searched store documents",
-                            "detail": "product_catalog.txt", "status": "done"}
+    assert events[1] == ("step", {"id": "search", "label": "Searched store documents",
+                                  "detail": "product_catalog.txt", "status": "done"})
     assert reply_text(events) == "Hello world"
-    assert events[-1][1] == {"sources": ["product_catalog.txt"], "cached": False, "fallback": False}
+    assert events[-1] == ("done", {"sources": ["product_catalog.txt"], "cached": False, "fallback": False})
     assert len(cache.stored) == 1  # no tool used, so the answer is cached
 
 
-def test_newlines_in_tokens_survive(monkeypatch):
-    p, *_ = make_pipeline(monkeypatch, stream_text=("Options:", "\n\n", "- a", "\n", "- b"))
-    assert reply_text(parse(p.answer_stream("hi"))) == "Options:\n\n- a\n- b"
-
-
-def test_streaming_call_asks_for_usage_and_cost_is_logged(monkeypatch):
+def test_plain_answer_costs_exactly_one_model_call(monkeypatch):
+    # The model's first reply IS the answer and is streamed as it arrives -
+    # there is no second "write it again" call.
     p, client, cache, costs = make_pipeline(monkeypatch)
+    list(p.answer_stream("What is your return policy?"))
+    assert len(client.calls) == 1 and client.parse_calls == []
+    assert costs.labels == ["stream_answer"]
+
+
+def test_every_streaming_call_asks_for_usage_so_cost_is_logged(monkeypatch):
+    p, client, cache, costs = make_pipeline(monkeypatch, tool_calls=[tool_call()])
     list(p.answer_stream("hi"))
-    stream_call = [c for c in client.calls if c.get("stream")][0]
-    assert stream_call["stream_options"] == {"include_usage": True}
-    assert "stream_answer" in costs.labels
+    assert client.calls and all(c["stream"] and c["stream_options"] == {"include_usage": True} for c in client.calls)
+    assert costs.labels == ["agent_iteration", "stream_answer"]  # the tool turn, then the answer turn
 
 
 def test_tool_use_emits_trail_and_product_card(monkeypatch):
     p, client, cache, costs = make_pipeline(monkeypatch, tool_calls=[tool_call()])
-    events = parse(p.answer_stream("Is the SummitCarry backpack in stock?"))
+    events = list(p.answer_stream("Is the SummitCarry backpack in stock?"))
 
-    steps = [pl_ for n, pl_ in events if n == "step" and pl_["id"] == "call_1"]
+    steps = [data for name, data in events if name == "step" and data["id"] == "call_1"]
     assert [s["status"] for s in steps] == ["running", "done"]
     assert steps[0]["label"] == "Checking live stock" and steps[1]["label"] == "Checked live stock"
     assert steps[0]["detail"] == "TP-PCK-003"
 
-    products = [pl_ for n, pl_ in events if n == "product"]
+    products = [data for name, data in events if name == "product"]
     assert len(products) == 1
     assert products[0]["sku"] == "TP-PCK-003" and products[0]["stock"] == 0
+    assert reply_text(events) == "Hello world"   # the answer streams after the tool turn
+    assert len(client.calls) == 2                # tool turn + answer turn, nothing extra
     assert cache.stored == []  # live stock must never be cached
+
+
+def test_two_tool_requests_in_one_turn_are_both_run_in_order(monkeypatch):
+    calls = [tool_call(call_id="call_1", arguments='{"sku": "TP-PCK-003"}'),
+             tool_call(call_id="call_2", arguments='{"sku": "TP-POLE-006"}')]
+    p, client, cache, costs = make_pipeline(monkeypatch, tool_calls=calls)
+    events = list(p.answer_stream("hi"))
+    assert [data["sku"] for name, data in events if name == "product"] == ["TP-PCK-003", "TP-POLE-006"]
+    # the assistant turn and both tool results were added to the conversation for the next model call
+    second_call_messages = client.calls[1]["messages"]
+    assert [m["role"] for m in second_call_messages[-3:]] == ["assistant", "tool", "tool"]
+    assert [t["id"] for t in second_call_messages[-3]["tool_calls"]] == ["call_1", "call_2"]
 
 
 def test_unknown_sku_gives_no_product_card(monkeypatch):
     p, *_ = make_pipeline(monkeypatch, tool_calls=[tool_call(arguments='{"sku": "NOPE-1"}')])
-    events = parse(p.answer_stream("hi"))
-    assert [n for n, _ in events if n == "product"] == []
+    events = list(p.answer_stream("hi"))
+    assert "product" not in names(events)
 
 
 def test_out_of_scope_question_gets_the_fallback_message(monkeypatch):
     p, client, cache, costs = make_pipeline(monkeypatch, distances=(0.95, 0.9))
-    events = parse(p.answer_stream("What is the capital of France?"))
+    events = list(p.answer_stream("What is the capital of France?"))
     assert reply_text(events) == p.FALLBACK_MESSAGE
     assert events[-1] == ("done", {"sources": [], "cached": False, "fallback": True})
     assert client.calls == []  # no model call was made
@@ -176,38 +191,91 @@ def test_out_of_scope_question_gets_the_fallback_message(monkeypatch):
 
 def test_cache_hit_is_served_without_calling_the_model(monkeypatch):
     p, client, cache, costs = make_pipeline(monkeypatch, cache_hit={"response": "saved answer", "full_context": ""})
-    events = parse(p.answer_stream("hi"))
+    events = list(p.answer_stream("hi"))
     assert reply_text(events) == "saved answer"
     assert events[-1] == ("done", {"sources": [], "cached": True, "fallback": False})
     assert client.calls == []
 
 
+def test_cached_answer_that_comes_back_as_bytes_is_decoded(monkeypatch):
+    p, *_ = make_pipeline(monkeypatch, cache_hit={"response": b"saved answer", "full_context": b""})
+    assert reply_text(list(p.answer_stream("hi"))) == "saved answer"
+
+
 def test_runaway_agent_loop_ends_with_a_safe_message(monkeypatch):
     p, *_ = make_pipeline(monkeypatch, tool_calls=[tool_call()], always_tools=True)
     p.max_iterations = 2
-    events = parse(p.answer_stream("hi"))
+    events = list(p.answer_stream("hi"))
     assert "wasn't able to fully work through" in reply_text(events)
     assert events[-1][1]["fallback"] is True
 
 
-def test_failure_becomes_an_error_event_without_leaking_details(monkeypatch):
+def test_an_empty_reply_is_never_cached(monkeypatch):
+    p, client, cache, costs = make_pipeline(monkeypatch, stream_text=("  ",))
+    list(p.answer_stream("hi"))
+    assert cache.stored == []
+
+
+def test_a_failure_inside_the_pipeline_propagates_to_the_caller(monkeypatch):
+    # answer_stream does not swallow errors: src/api/streaming.py turns them into an `error` event
     p, *_ = make_pipeline(monkeypatch)
 
     def boom(text):
-        raise RuntimeError("secret internal detail: redis at 10.0.0.5 refused")
+        raise RuntimeError("redis refused")
 
     monkeypatch.setattr(pl, "get_embedding", boom)
-    events = parse(p.answer_stream("hi"))
-    assert events[-1][0] == "error"
-    assert "secret" not in events[-1][1]["message"]
+    try:
+        list(p.answer_stream("hi"))
+        raised = False
+    except RuntimeError:
+        raised = True
+    assert raised
 
 
-# ---------- the non-streaming path still works the same -------------------------
+# ---------- answer: one finished dict (used by /ask and the evaluation) ---------
 
-def test_run_agent_loop_still_returns_the_old_triple(monkeypatch):
-    p, *_ = make_pipeline(monkeypatch, tool_calls=[tool_call()])
-    messages = [{"role": "user", "content": "hi"}]
-    out_messages, parts, hit_cap = p._run_agent_loop(messages)
-    assert hit_cap is False
-    assert len(parts) == 1 and "SummitCarry" in parts[0]
-    assert out_messages is messages
+def test_answer_returns_structured_text_and_sources(monkeypatch):
+    p, client, cache, costs = make_pipeline(monkeypatch)
+    result = p.answer("What is your return policy?")
+
+    assert result["answer"] == "Structured answer"
+    assert result["sources"] == ["returns_policy.txt"]      # what the model said it relied on
+    assert result["used_fallback"] is False and result["from_cache"] is False
+    assert result["full_context"] == "chunk about packs"
+    assert len(client.calls) == 1 and len(client.parse_calls) == 1
+    # the loop's own last turn is not shown to anyone; the structured call writes the answer
+    assert costs.labels == ["agent_iteration", "final_answer"]
+    assert [c[1] for c in cache.stored] == ["Structured answer"]
+
+
+def test_answer_with_a_tool_is_not_cached_and_keeps_the_tool_output_as_context(monkeypatch):
+    p, client, cache, costs = make_pipeline(monkeypatch, tool_calls=[tool_call()])
+    result = p.answer("Is the SummitCarry backpack in stock?")
+    assert "SummitCarry" in result["full_context"]
+    assert cache.stored == []
+
+
+def test_answer_passes_the_custom_final_instruction_to_the_structured_call(monkeypatch):
+    # src/evaluation/ab_test.py relies on this
+    p, client, cache, costs = make_pipeline(monkeypatch, pipeline_kwargs={"final_answer_instruction": "BE BRIEF"})
+    p.answer("hi")
+    assert client.parse_calls[0]["messages"][-1] == {"role": "user", "content": "BE BRIEF"}
+
+
+def test_answer_out_of_scope_and_cache_hit(monkeypatch):
+    p, client, *_ = make_pipeline(monkeypatch, distances=(0.95,))
+    result = p.answer("What is the capital of France?")
+    assert result["answer"] == p.FALLBACK_MESSAGE and result["used_fallback"] is True and result["sources"] == []
+    assert client.calls == []
+
+    p, client, *_ = make_pipeline(monkeypatch, cache_hit={"response": "saved", "full_context": "ctx"})
+    result = p.answer("hi")
+    assert result["answer"] == "saved" and result["from_cache"] is True and client.calls == []
+
+
+def test_answer_runaway_loop_reports_incomplete_work(monkeypatch):
+    p, client, *_ = make_pipeline(monkeypatch, tool_calls=[tool_call()], always_tools=True)
+    p.max_iterations = 2
+    result = p.answer("hi")
+    assert result["used_fallback"] is True and "wasn't able to fully work through" in result["answer"]
+    assert client.parse_calls == []   # no structured call is made for an incomplete loop

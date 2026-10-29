@@ -1,9 +1,21 @@
 # src/rag/pipeline.py
+#
+# How to read this file (top to bottom is also the order things happen):
+#
+#   answer() / answer_stream()   the two public entry points. Each one is short:
+#        |
+#        +-- _prepare()          embed the question, check the cache, retrieve, build the prompt
+#        +-- _agent_loop()       let the model call tools until it writes the answer
+#        |      +-- _model_turn()   one streamed call to the model
+#        |      +-- _run_tool()     run one tool the model asked for
+#        +-- _maybe_cache()      remember the answer (only if no live data was used)
+#
+# The data shapes live in models.py; the wording of the UI trail lives in events.py.
+#
+# answer_stream() yields (event_name, data) pairs. It knows nothing about HTTP or SSE;
+# src/api/streaming.py turns those pairs into the text the browser receives.
 import json
-import logging
 from openai import OpenAI
-from pydantic import BaseModel
-from typing import List
 
 from src.core.config import DEFAULT_MODEL, RELEVANCE_THRESHOLD, RETRIEVAL_K
 from src.core.embeddings import get_embedding
@@ -13,37 +25,33 @@ from src.tools.calculator_tool import TOOL_SCHEMA as CALC_SCHEMA, TOOL_FUNCTION 
 from src.rag.prompts import build_answer_prompt, FINAL_ANSWER_INSTRUCTION, SYSTEM_PROMPT
 from src.core.semantic_cache import SemanticCache
 from src.cost.tracker import cost_tracker
+from src.rag.models import FinalAnswer, ToolRequest, LoopResult, Prepared
+from src.rag.events import search_step, tool_step
 
 from langsmith import traceable
 
-logger = logging.getLogger(__name__)
-
-# tool name -> (label while running, label when finished), for the trail the UI shows
-TOOL_LABELS = {
-    "CheckAvailability": ("Checking live stock", "Checked live stock"),
-    "CalculateTotal": ("Adding the prices", "Added the prices"),
-}
+CAP_MESSAGE = "I wasn't able to fully work through this request - it may need to be broken into simpler questions."
 
 
-def sse(event, data):
-    """One Server-Sent Event. The payload is JSON, so a newline inside a token
-    can never break the event framing."""
-    return f"event: {event}\ndata: {json.dumps(data)}\n\n"
+# ---------- small helpers --------------------------------------------------------
+
+def _text(value):
+    return value.decode() if isinstance(value, bytes) else value
 
 
-def _tool_step(event, status):
-    running, finished = TOOL_LABELS.get(event["name"], (event["name"], event["name"]))
-    if event["name"] == "CheckAvailability":
-        detail = event["args"].get("sku", "")
-    else:
-        detail = event.get("result", "") if status == "done" else ""
-    return {"id": event["id"], "label": running if status == "running" else finished,
-            "detail": detail, "status": status}
+def _full_context(chunks, tool_outputs):
+    """The text the answer was based on (also used by the evaluation metrics)."""
+    return "\n\n".join(list(chunks) + list(tool_outputs))
 
 
-class FinalAnswer(BaseModel):
-    answer: str
-    sources_used: List[str]
+def _drain(events):
+    """Run a generator to the end, ignoring what it yields, and return what it returns.
+    answer() uses this: it wants the loop's result, not the live events."""
+    try:
+        while True:
+            next(events)
+    except StopIteration as stop:
+        return stop.value
 
 
 class RAGPipeline:
@@ -64,6 +72,104 @@ class RAGPipeline:
             "items and calculating totals. What are you looking for?"
         )
 
+    # ---------- the two public entry points ---------------------------------------
+
+    @traceable(name="rag_answer")
+    def answer(self, query, k=None):
+        """One finished answer as a dict (used by /ask and the evaluation scripts)."""
+        prep = self._prepare(query, k)
+
+        if prep.cached:
+            return {"answer": prep.cached["response"], "sources": [], "used_fallback": False,
+                    "full_context": prep.cached["full_context"], "from_cache": True}
+
+        if prep.out_of_scope:
+            return {"answer": self.FALLBACK_MESSAGE, "sources": [], "used_fallback": True,
+                    "full_context": _full_context(prep.chunks, []), "from_cache": False}
+
+        # The loop's own last turn is thrown away here: the structured call below
+        # writes the answer again, in a shape that also names the sources it used.
+        result = _drain(self._agent_loop(prep.messages, final_label="agent_iteration"))
+        full_context = _full_context(prep.chunks, result.tool_outputs)
+
+        if result.hit_cap:
+            # Report incompleteness honestly rather than guess at an answer built from partial steps
+            return {"answer": CAP_MESSAGE, "sources": prep.unique_sources, "used_fallback": True,
+                    "full_context": full_context, "from_cache": False}
+
+        prep.messages.append({"role": "user", "content": self.final_answer_instruction})
+        final = self.client.chat.completions.parse(model=self.model, messages=prep.messages, response_format=FinalAnswer)
+        cost_tracker.record(
+            model=self.model,
+            input_tokens=final.usage.prompt_tokens,
+            output_tokens=final.usage.completion_tokens,
+            label="final_answer",
+        )
+        parsed = final.choices[0].message.parsed
+
+        self._maybe_cache(query, parsed.answer, prep.embedding, result.tool_outputs, full_context)
+        return {"answer": parsed.answer, "sources": parsed.sources_used,
+                "used_fallback": False, "full_context": full_context, "from_cache": False}
+
+    def answer_stream(self, query, k=None):
+        """The same question, answered live. Yields (event_name, data) pairs:
+          step    - one line of the trail the UI shows: {id, label, detail, status}
+          product - a live inventory result, drawn as a card: {sku, name, price, stock, sizes}
+          token   - a piece of the answer text: {t}
+          done    - the last event: {sources, cached, fallback}
+        If something raises, the caller (src/api/streaming.py) turns it into an `error` event."""
+        yield search_step("Searching store documents", status="running")
+        prep = self._prepare(query, k)
+
+        if prep.cached:
+            yield search_step("Found a saved answer")
+            yield "token", {"t": prep.cached["response"]}
+            yield "done", {"sources": [], "cached": True, "fallback": False}
+            return
+
+        if prep.out_of_scope:
+            yield search_step("Searched store documents", "no close match")
+            yield "token", {"t": self.FALLBACK_MESSAGE}
+            yield "done", {"sources": [], "cached": False, "fallback": True}
+            return
+
+        yield search_step("Searched store documents", ", ".join(prep.unique_sources))
+        result = yield from self._agent_loop(prep.messages)   # streams tokens, steps and product cards
+
+        if result.hit_cap:
+            yield "token", {"t": CAP_MESSAGE}
+            yield "done", {"sources": prep.unique_sources, "cached": False, "fallback": True}
+            return
+
+        self._maybe_cache(query, result.text, prep.embedding, result.tool_outputs, _full_context(prep.chunks, result.tool_outputs))
+        yield "done", {"sources": prep.unique_sources, "cached": False, "fallback": False}
+
+    # ---------- steps both entry points share -------------------------------------
+
+    def _prepare(self, query, k=None):
+        """Embed the question, look in the cache, retrieve, and build the prompt."""
+        embedding = get_embedding(query)
+
+        cached = self.cache.check(query_embedding=embedding) if self.use_cache else None
+        if cached:
+            return Prepared(embedding=embedding, cached={"response": _text(cached["response"]),
+                                                         "full_context": _text(cached["full_context"])})
+
+        chunks, sources, distances = self.retrieve(embedding, k=k)
+        if self._is_out_of_scope(distances):
+            return Prepared(embedding=embedding, out_of_scope=True, chunks=chunks, sources=sources)
+
+        messages = [
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": build_answer_prompt(query, chunks, sources)},
+        ]
+        return Prepared(embedding=embedding, chunks=chunks, sources=sources, messages=messages)
+
+    def _maybe_cache(self, query, text, embedding, tool_outputs, full_context):
+        """Save the answer for next time - but never if live data (stock, prices) went into it."""
+        if not tool_outputs and self.use_cache and text.strip():
+            self.cache.store(query, text, embedding, full_context)
+
     @traceable(name="retrieve")
     def retrieve(self, query_embedding, k=None):
         k = k or self.k
@@ -74,198 +180,89 @@ class RAGPipeline:
     def _is_out_of_scope(self, distances):
         return all(d >= self.relevance_threshold for d in distances)
 
-    def _agent_events(self, messages):
-        """ReAct loop (Day 16) as a generator: keep letting the model act and
-        observe until it stops requesting tools, or hit max_iterations as a
-        safety guard against a runaway/non-progressing loop. Only turns
-        that involved a real tool call get appended - a final "no more
-        tools needed" turn is discarded, since the follow-up structured
-        answer call re-derives the response fresh anyway.
+    # ---------- the ReAct loop (the one and only) ---------------------------------
 
-        Yields a tool_start / tool_done event around every tool call so a
-        caller can show progress live, then one last "finished" event."""
-        tool_context_parts = []
+    def _agent_loop(self, messages, final_label="stream_answer"):
+        """Let the model act and observe until it stops asking for tools, or give up after
+        max_iterations (a guard against a runaway loop). `messages` grows as it goes.
+
+        Every model call is streamed, so the turn in which the model stops asking for tools
+        IS the final answer - its tokens have already been yielded. Nothing is generated twice.
+
+        Yields the live events (token / step / product) and returns a LoopResult.
+        `final_label` is the name the last turn's cost is logged under."""
+        tool_outputs = []
         for _ in range(self.max_iterations):
-            response = self.client.chat.completions.create(
-                model=self.model, messages=messages, tools=self.tools
-            )
-            cost_tracker.record(
-                model=self.model,
-                input_tokens=response.usage.prompt_tokens,
-                output_tokens=response.usage.completion_tokens,
-                label="agent_iteration",
-            )
-            response_message = response.choices[0].message
-
-            if not response_message.tool_calls:
-                yield {"type": "finished", "tool_context_parts": tool_context_parts, "hit_cap": False}
-                return
-
-            messages.append(response_message)
-            for tool_call in response_message.tool_calls:
-                name = tool_call.function.name
-                args = json.loads(tool_call.function.arguments)
-                yield {"type": "tool_start", "id": tool_call.id, "name": name, "args": args}
-                result = self.available_functions[name](**args)
-                tool_context_parts.append(result)
-                messages.append({"role": "tool", "tool_call_id": tool_call.id, "content": result})
-                yield {"type": "tool_done", "id": tool_call.id, "name": name, "args": args, "result": result}
-
-        # hit the cap without a final answer
-        yield {"type": "finished", "tool_context_parts": tool_context_parts, "hit_cap": True}
-
-    @traceable(name="agent_loop")
-    def _run_agent_loop(self, messages):
-        """Non-streaming callers only want the end state, so run the generator
-        to its final event and return the same triple as before."""
-        for event in self._agent_events(messages):
-            if event["type"] == "finished":
-                return messages, event["tool_context_parts"], event["hit_cap"]
-
-    @traceable(name="rag_answer")
-    def answer(self, query, k=None):
-        query_embedding = get_embedding(query)
-
-        # Check if the response is already cached in Redis
-        cached = self.cache.check(query_embedding=query_embedding) if self.use_cache else None
-        if cached:
-            return {
-                "answer": cached["response"],
-                "sources": [],
-                "used_fallback": False,
-                "full_context": cached["full_context"],
-                "from_cache": True
-            }
-
-        chunks, sources, distances = self.retrieve(query_embedding, k=k)
-
-        if self._is_out_of_scope(distances):
-            return {
-                "answer": self.FALLBACK_MESSAGE,
-                "sources": [],
-                "used_fallback": True,
-                "full_context": "\n\n".join(chunks),
-                "from_cache": False
-            }
-
-        messages = [
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": build_answer_prompt(query, chunks, sources)}
-        ]
-        messages, tool_context_parts, hit_cap = self._run_agent_loop(messages)
-
-        full_context = "\n\n".join(chunks)
-        if tool_context_parts:
-            full_context += "\n\n" + "\n\n".join(tool_context_parts)
-
-        if hit_cap:
-            # Safe failure, same principle as Day 16 - report incompleteness
-            # honestly rather than guess at an answer built from partial steps
-            return {"answer": "I wasn't able to fully work through this request - it may need to be broken into simpler questions.",
-                    "sources": list(set(sources)), "used_fallback": True, "full_context": full_context, "from_cache": False}
-
-        messages.append({"role": "user", "content": self.final_answer_instruction})
-        final = self.client.chat.completions.parse(model=self.model, messages=messages, response_format=FinalAnswer)
-        cost_tracker.record(
-            model=self.model,
-            input_tokens=final.usage.prompt_tokens,
-            output_tokens=final.usage.completion_tokens,
-            label="final_answer",
-        )
-        parsed = final.choices[0].message.parsed
-
-        if not tool_context_parts and not hit_cap and self.use_cache:
-            self.cache.store(query, parsed.answer, query_embedding, full_context)
-
-        return {"answer": parsed.answer, "sources": parsed.sources_used,
-                "used_fallback": False, "full_context": full_context, "from_cache": False}
-
-    def answer_stream(self, query, k=None):
-        """Yields Server-Sent Events with JSON payloads:
-          step    - one line of the trail the UI shows: {id, label, detail, status}
-          product - a live inventory result, drawn as a card: {sku, name, price, stock, sizes}
-          token   - a piece of the answer text: {t}
-          done    - last event on success: {sources, cached, fallback}
-          error   - something failed, the stream ends: {message}
-        """
-        try:
-            yield from self._stream_events(query, k)
-        except Exception:
-            logger.exception("answer_stream failed")
-            yield sse("error", {"message": "Something went wrong while answering. Please try again."})
-
-    def _stream_events(self, query, k=None):
-        yield sse("step", {"id": "search", "label": "Searching store documents", "detail": "", "status": "running"})
-        query_embedding = get_embedding(query)
-
-        cached = self.cache.check(query_embedding=query_embedding) if self.use_cache else None
-        if cached:
-            text = cached["response"]
-            if isinstance(text, bytes):
-                text = text.decode()
-            yield sse("step", {"id": "search", "label": "Found a saved answer", "detail": "", "status": "done"})
-            yield sse("token", {"t": text})
-            yield sse("done", {"sources": [], "cached": True, "fallback": False})
-            return
-
-        chunks, sources, distances = self.retrieve(query_embedding, k=k)
-
-        if self._is_out_of_scope(distances):
-            yield sse("step", {"id": "search", "label": "Searched store documents", "detail": "no close match", "status": "done"})
-            yield sse("token", {"t": self.FALLBACK_MESSAGE})
-            yield sse("done", {"sources": [], "cached": False, "fallback": True})
-            return
-
-        unique_sources = list(dict.fromkeys(sources))
-        yield sse("step", {"id": "search", "label": "Searched store documents", "detail": ", ".join(unique_sources), "status": "done"})
-
-        messages = [
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": build_answer_prompt(query, chunks, sources)}
-        ]
-
-        tool_context_parts, hit_cap = [], False
-        for event in self._agent_events(messages):
-            if event["type"] == "tool_start":
-                yield sse("step", _tool_step(event, "running"))
-            elif event["type"] == "tool_done":
-                yield sse("step", _tool_step(event, "done"))
-                if event["name"] == "CheckAvailability":
-                    product = get_product(event["args"].get("sku", ""))
-                    if product:
-                        yield sse("product", product)
-            else:  # "finished"
-                tool_context_parts, hit_cap = event["tool_context_parts"], event["hit_cap"]
-
-        full_context = "\n\n".join(chunks)
-        if tool_context_parts:
-            full_context += "\n\n" + "\n\n".join(tool_context_parts)
-
-        if hit_cap:
-            yield sse("token", {"t": "I wasn't able to fully work through this request - it may need to be broken into simpler questions."})
-            yield sse("done", {"sources": unique_sources, "cached": False, "fallback": True})
-            return
-
-        full_reply = ""
-        stream = self.client.chat.completions.create(
-            model=self.model, messages=messages, stream=True,
-            stream_options={"include_usage": True},  # without this, chunk.usage is always empty and no cost is logged
-        )
-        for chunk in stream:
-            if chunk.choices:
-                delta = chunk.choices[0].delta.content
-                if delta:
-                    full_reply += delta
-                    yield sse("token", {"t": delta})
-            if chunk.usage:
+            text, requests, usage = yield from self._model_turn(messages)
+            if usage:
                 cost_tracker.record(
                     model=self.model,
-                    input_tokens=chunk.usage.prompt_tokens,
-                    output_tokens=chunk.usage.completion_tokens,
-                    label="stream_answer",
+                    input_tokens=usage.prompt_tokens,
+                    output_tokens=usage.completion_tokens,
+                    label="agent_iteration" if requests else final_label,
                 )
 
-        if not tool_context_parts and self.use_cache:
-            self.cache.store(query, full_reply, query_embedding, full_context)
+            if not requests:
+                return LoopResult(text=text, tool_outputs=tool_outputs, hit_cap=False)
 
-        yield sse("done", {"sources": unique_sources, "cached": False, "fallback": False})
+            # remember what the model asked for, then answer each request with a "tool" message
+            messages.append({
+                "role": "assistant",
+                "content": text or None,
+                "tool_calls": [{"id": r.id, "type": "function", "function": {"name": r.name, "arguments": r.arguments}}
+                               for r in requests],
+            })
+            for request in requests:
+                output = yield from self._run_tool(request, messages)
+                tool_outputs.append(output)
+
+        return LoopResult(text="", tool_outputs=tool_outputs, hit_cap=True)
+
+    def _model_turn(self, messages):
+        """One streamed call to the model. Yields a token event for each piece of text.
+        Returns (text, tool_requests, usage).
+
+        A tool request does not arrive whole: an id and name come first, then the JSON
+        arguments a few characters at a time. Each piece carries an `index` saying which
+        request it belongs to, so the pieces are gathered per index."""
+        stream = self.client.chat.completions.create(
+            model=self.model, messages=messages, tools=self.tools,
+            stream=True,
+            stream_options={"include_usage": True},  # without this, no usage arrives and no cost is logged
+        )
+        text, by_index, usage = "", {}, None
+        for chunk in stream:
+            if chunk.usage:
+                usage = chunk.usage
+            if not chunk.choices:
+                continue
+            delta = chunk.choices[0].delta
+            if delta.content:
+                text += delta.content
+                yield "token", {"t": delta.content}
+            for piece in delta.tool_calls or []:
+                request = by_index.setdefault(piece.index, ToolRequest())
+                if piece.id:
+                    request.id = piece.id
+                if piece.function and piece.function.name:
+                    request.name = piece.function.name
+                if piece.function and piece.function.arguments:
+                    request.arguments += piece.function.arguments
+
+        return text, [by_index[i] for i in sorted(by_index)], usage
+
+    def _run_tool(self, request, messages):
+        """Run one tool the model asked for. Adds its result to `messages` (so the model sees
+        it next turn), yields the trail steps and any product card, and returns the result."""
+        args = json.loads(request.arguments)
+        yield tool_step(request, args, "running")
+
+        result = self.available_functions[request.name](**args)
+        messages.append({"role": "tool", "tool_call_id": request.id, "content": result})
+
+        yield tool_step(request, args, "done", result)
+        if request.name == "CheckAvailability":
+            product = get_product(args.get("sku", ""))
+            if product:
+                yield "product", product
+        return result

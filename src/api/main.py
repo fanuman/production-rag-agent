@@ -8,6 +8,7 @@ load_secret_into_env()
 
 from src.core.llm_client import ProductionLLMClient
 from src.rag.pipeline import RAGPipeline
+from src.api.streaming import sse_stream
 from src.api.models import ChatRequest, ChatResponse, ChatMetaData, RagRequest, RagResponse
 
 from fastapi import FastAPI, HTTPException
@@ -110,7 +111,7 @@ def ask(request: Request, rag_request: RagRequest):
 @limiter.limit("10/minute")
 def ask_stream(request: Request, rag_request: RagRequest):
     return StreamingResponse(
-        rag_pipeline.answer_stream(rag_request.message),
+        sse_stream(rag_pipeline.answer_stream(rag_request.message)),
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},  # stop proxies from buffering the stream
     )
