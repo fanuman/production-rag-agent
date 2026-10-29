@@ -13,12 +13,14 @@ SYSTEM_PROMPT = (
 )
 
 
-def build_answer_prompt(query, chunks, sources):
+def build_answer_prompt(query, chunks, sources, sources_footer=False):
+    # sources_footer=True puts the SOURCES: request right after the question, where the model reads it last.
+    footer_request = f"\n{SOURCES_FOOTER_INSTRUCTION}\n\n" if sources_footer else ""
     context = "\n\n".join(
         f"[Source: {source}]\n{chunk}"
         for chunk, source in zip(chunks, sources)
     )
-    return f"""Answer the question using the context below for product details and policies. Cite which source document(s) you used in your answer.
+    return f"""Answer the question using the context below for product details and policies. Do not write source file names in your answer; the app shows the sources separately.
 
 You may reason across multiple pieces of context to reach a conclusion — for example, if the context lists which countries are supported, you can correctly conclude "no" for a country not on that list, without the specific country needing to be named directly.
 
@@ -35,11 +37,22 @@ Context:
 \"\"\"
 
 Question: {query}
-Answer:"""
+{footer_request}Answer:"""
 
 
 FINAL_ANSWER_INSTRUCTION = (
     "Now provide your final answer. In sources_used, list only the "
     "source document filenames whose content you actually relied on "
     "to construct THIS answer - not every document you were given."
+)
+
+
+# Added to the user prompt (right after the question) only for the streamed answer. /ask gets its
+# sources from the structured final call instead, so it does not need this.
+SOURCES_FOOTER_INSTRUCTION = (
+    "After your answer, end with one last line in exactly this form (this line is required):\n"
+    "SOURCES: file1.txt, file2.txt\n"
+    "Name only the documents whose content you actually used for THIS answer, "
+    "using the file names from the [Source: ...] labels in the context above. "
+    "If you used none of them, write: SOURCES: none"
 )

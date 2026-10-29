@@ -25,8 +25,9 @@ from src.tools.calculator_tool import TOOL_SCHEMA as CALC_SCHEMA, TOOL_FUNCTION 
 from src.rag.prompts import build_answer_prompt, FINAL_ANSWER_INSTRUCTION, SYSTEM_PROMPT
 from src.core.semantic_cache import SemanticCache
 from src.cost.tracker import cost_tracker
-from src.rag.models import FinalAnswer, ToolRequest, LoopResult, Prepared
+from src.rag.models import FinalAnswer, ToolRequest, Turn, LoopResult, Prepared
 from src.rag.events import search_step, tool_step
+from src.rag.sources_footer import SourcesFooter, resolve_sources
 
 from langsmith import traceable
 
@@ -119,7 +120,7 @@ class RAGPipeline:
           done    - the last event: {sources, cached, fallback}
         If something raises, the caller (src/api/streaming.py) turns it into an `error` event."""
         yield search_step("Searching store documents", status="running")
-        prep = self._prepare(query, k)
+        prep = self._prepare(query, k, footer=True)
 
         if prep.cached:
             yield search_step("Found a saved answer")
@@ -134,7 +135,7 @@ class RAGPipeline:
             return
 
         yield search_step("Searched store documents", ", ".join(prep.unique_sources))
-        result = yield from self._agent_loop(prep.messages)   # streams tokens, steps and product cards
+        result = yield from self._agent_loop(prep.messages, footer=True)   # streams tokens, steps and product cards
 
         if result.hit_cap:
             yield "token", {"t": CAP_MESSAGE}
@@ -142,12 +143,13 @@ class RAGPipeline:
             return
 
         self._maybe_cache(query, result.text, prep.embedding, result.tool_outputs, _full_context(prep.chunks, result.tool_outputs))
-        yield "done", {"sources": prep.unique_sources, "cached": False, "fallback": False}
+        yield "done", {"sources": resolve_sources(result.footer, prep.unique_sources), "cached": False, "fallback": False}
 
     # ---------- steps both entry points share -------------------------------------
 
-    def _prepare(self, query, k=None):
-        """Embed the question, look in the cache, retrieve, and build the prompt."""
+    def _prepare(self, query, k=None, footer=False):
+        """Embed the question, look in the cache, retrieve, and build the prompt.
+        footer=True also asks the model to end with a SOURCES: line (streamed answers only)."""
         embedding = get_embedding(query)
 
         cached = self.cache.check(query_embedding=embedding) if self.use_cache else None
@@ -161,7 +163,7 @@ class RAGPipeline:
 
         messages = [
             {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": build_answer_prompt(query, chunks, sources)},
+            {"role": "user", "content": build_answer_prompt(query, chunks, sources, sources_footer=footer)},
         ]
         return Prepared(embedding=embedding, chunks=chunks, sources=sources, messages=messages)
 
@@ -182,7 +184,7 @@ class RAGPipeline:
 
     # ---------- the ReAct loop (the one and only) ---------------------------------
 
-    def _agent_loop(self, messages, final_label="stream_answer"):
+    def _agent_loop(self, messages, final_label="stream_answer", footer=False):
         """Let the model act and observe until it stops asking for tools, or give up after
         max_iterations (a guard against a runaway loop). `messages` grows as it goes.
 
@@ -190,37 +192,43 @@ class RAGPipeline:
         IS the final answer - its tokens have already been yielded. Nothing is generated twice.
 
         Yields the live events (token / step / product) and returns a LoopResult.
-        `final_label` is the name the last turn's cost is logged under."""
+        `final_label` is the name the last turn's cost is logged under.
+        footer=True hides the SOURCES: line the model was asked to write (see _model_turn)."""
         tool_outputs = []
         for _ in range(self.max_iterations):
-            text, requests, usage = yield from self._model_turn(messages)
-            if usage:
+            turn = yield from self._model_turn(messages, footer)
+            if turn.usage:
                 cost_tracker.record(
                     model=self.model,
-                    input_tokens=usage.prompt_tokens,
-                    output_tokens=usage.completion_tokens,
-                    label="agent_iteration" if requests else final_label,
+                    input_tokens=turn.usage.prompt_tokens,
+                    output_tokens=turn.usage.completion_tokens,
+                    label="agent_iteration" if turn.requests else final_label,
                 )
 
-            if not requests:
-                return LoopResult(text=text, tool_outputs=tool_outputs, hit_cap=False)
+            if not turn.requests:
+                return LoopResult(text=turn.text, tool_outputs=tool_outputs, hit_cap=False, footer=turn.footer)
 
             # remember what the model asked for, then answer each request with a "tool" message
             messages.append({
                 "role": "assistant",
-                "content": text or None,
+                "content": turn.text or None,
                 "tool_calls": [{"id": r.id, "type": "function", "function": {"name": r.name, "arguments": r.arguments}}
-                               for r in requests],
+                               for r in turn.requests],
             })
-            for request in requests:
+            for request in turn.requests:
                 output = yield from self._run_tool(request, messages)
                 tool_outputs.append(output)
 
         return LoopResult(text="", tool_outputs=tool_outputs, hit_cap=True)
 
-    def _model_turn(self, messages):
+    def _model_turn(self, messages, footer=False):
         """One streamed call to the model. Yields a token event for each piece of text.
-        Returns (text, tool_requests, usage).
+        Returns a Turn (text, tool requests, usage, footer).
+
+        With footer=True the model was asked to end with a SOURCES: line. SourcesFooter keeps
+        that line out of the tokens (and out of `text`) and hands it back as `footer`. A new
+        SourcesFooter is made for every turn, so text a model writes before calling a tool
+        can never swallow the final answer.
 
         A tool request does not arrive whole: an id and name come first, then the JSON
         arguments a few characters at a time. Each piece carries an `index` saying which
@@ -230,6 +238,7 @@ class RAGPipeline:
             stream=True,
             stream_options={"include_usage": True},  # without this, no usage arrives and no cost is logged
         )
+        splitter = SourcesFooter() if footer else None
         text, by_index, usage = "", {}, None
         for chunk in stream:
             if chunk.usage:
@@ -238,8 +247,10 @@ class RAGPipeline:
                 continue
             delta = chunk.choices[0].delta
             if delta.content:
-                text += delta.content
-                yield "token", {"t": delta.content}
+                shown = splitter.feed(delta.content) if splitter else delta.content
+                if shown:
+                    text += shown
+                    yield "token", {"t": shown}
             for piece in delta.tool_calls or []:
                 request = by_index.setdefault(piece.index, ToolRequest())
                 if piece.id:
@@ -249,7 +260,14 @@ class RAGPipeline:
                 if piece.function and piece.function.arguments:
                     request.arguments += piece.function.arguments
 
-        return text, [by_index[i] for i in sorted(by_index)], usage
+        footer_text = None
+        if splitter:
+            rest, footer_text = splitter.finish()   # text that was held back but turned out to be plain text
+            if rest:
+                text += rest
+                yield "token", {"t": rest}
+
+        return Turn(text=text, requests=[by_index[i] for i in sorted(by_index)], usage=usage, footer=footer_text)
 
     def _run_tool(self, request, messages):
         """Run one tool the model asked for. Adds its result to `messages` (so the model sees

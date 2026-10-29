@@ -19,11 +19,21 @@ class ToolRequest:
 
 
 @dataclass
+class Turn:
+    """One streamed model call, once it has finished."""
+    text: str             # what the model wrote, without the SOURCES: footer
+    requests: list        # the tools it asked for (ToolRequest objects)
+    usage: object         # token counts, or None if the API sent none
+    footer: str = None    # the SOURCES: footer it wrote, if footers were asked for
+
+
+@dataclass
 class LoopResult:
     """What _agent_loop hands back when it is finished."""
     text: str             # what the model wrote in its last turn ("" if it hit the cap)
     tool_outputs: list    # the result of every tool call, in order
     hit_cap: bool         # True if it ran out of iterations without writing an answer
+    footer: str = None    # the SOURCES: footer of the final turn, if one was asked for and written
 
 
 @dataclass
