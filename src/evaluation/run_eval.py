@@ -8,7 +8,7 @@ from src.evaluation.regression import check_regression
 
 
 def run_eval():
-    pipeline = RAGPipeline()
+    pipeline = RAGPipeline(use_cache=False)
 
     faithfulness_scores = []
     relevancy_scores = []

@@ -19,7 +19,8 @@ sources it actually used.
 streaming protocol was rebuilt (typed events: `step`, `product`, `token`, `done`, `error`), the agent loop was
 collapsed into one streamed loop, a plain question went from 2 model calls to 1, the source chips under an answer
 now show only the files the model says it used, the pipeline was split into small modules, the suite grew to
-47 tests, API errors became generic (details are logged, never returned) and CORS is off unless you ask for it.
+51 tests, API errors became generic (details are logged, never returned), CORS is off unless you ask for it,
+the open `/chat` route was removed and `/cost` now reports what every model call has really cost.
 The FreightLens capstone is a separate repository:
 [`freight-doc-intelligence`](https://github.com/fanuman/freight-doc-intelligence).
 
@@ -178,8 +179,7 @@ local development without AWS credentials configured still works.
 | `GET /health` | Liveness check: `{"status": "ok"}` |
 | `POST /ask/stream` | The main endpoint: the question's answer as Server-Sent Events (table above). Rate limited to 10/minute |
 | `POST /ask` | The same question answered in one JSON response (`reply`, `sources`, `used_fallback`, `from_cache`). Rate limited to 10/minute. Used by the evaluation harness |
-| `POST /chat` | A plain chat completion with a short system prompt, no retrieval. Rate limited to 10/minute |
-| `GET /cost` | The `/chat` client's counters (calls, retries, total cost). It does not report `/ask` or `/ask/stream`; see Known gaps |
+| `GET /cost` | Totals for every model call the app has made, read from `logs/cost_log.jsonl`: `total_calls`, `total_cost_usd`, `cost_if_gpt4o_usd` and `by_stage` (same numbers as `python -m src.cost.report`). Public like `/health`, and totals only. On ECS the log lives in the container, so it covers spend since the task last started |
 | `GET /` | The web UI (static files, mounted last so it cannot shadow an API route) |
 
 Validation errors come back as `422` before any paid call is made. Upstream failures return a generic `502`
@@ -269,6 +269,7 @@ and `locustfile.py` (load testing used to verify rate limiting and caching under
 - **Prompt-injection defense.** The RAG agent has a real system prompt that frames retrieved context as untrusted data rather than instructions.
 - **No secret on the server.** `core/secrets.py` reads the OpenAI key from AWS Secrets Manager through an IAM role. No access key or `.env` secret exists on the deployed infrastructure.
 - **Generic errors.** Clients get "Upstream error. Please try again."; the details stay in the server log.
+- **No open model endpoint.** The general-purpose `/chat` route was removed; every model call the API makes goes through the RAG pipeline.
 - **CORS off by default**, and rate limiting (`slowapi`, Redis-backed) on every expensive endpoint.
 - **Key rotation** needs no code change; the runbook is in [`infra/README.md`](infra/README.md#rotate-the-openai-api-key).
 - **CloudWatch monitoring** (`infra/terraform/monitoring.tf`): a log metric filter turns the Secrets Manager fallback warning into an alertable metric, CPU and memory alarms watch the ECS service, an SNS email channel notifies, and a dashboard combines them. It was validated with a real fire drill (a deliberately corrupted secret), not only a `terraform apply`.
@@ -279,10 +280,10 @@ and `locustfile.py` (load testing used to verify rate limiting and caching under
 python -m pytest tests/
 ```
 
-47 tests, none of which call OpenAI, Chroma or Redis (they use fakes), so they run in about 3 seconds:
+51 tests, none of which call OpenAI, Chroma or Redis (they use fakes), so they run in about 3 seconds:
 `test_stream_events.py` (the pipeline's events, tools, cache, loop cap and sources), `test_sources_footer.py`
 (the footer, including text cut into pieces at every possible position), `test_sse.py` (the wire format and the generic error),
-`test_prompts.py` and `test_imports.py`.
+`test_cost_summary.py` (the `/cost` totals, and that `/chat` is gone), `test_prompts.py` and `test_imports.py`.
 
 **`.github/workflows/`** — a two-job pipeline: `test` (fast import-checks) gates `build-and-push`
 (builds the Docker image, pushes to ECR tagged by both commit SHA and `latest`).
@@ -360,8 +361,8 @@ Opens a web UI at `localhost:8089`.
 
 **7. Run the evaluation harness** (offline, deliberately not on the live request path). Both
 commands below need Chroma/Redis reachable — via Compose (`CHROMA_HOST=localhost
-CHROMA_PORT=8001 REDIS_HOST=localhost`) or another live instance. Flush Redis first
-(`docker compose exec redis redis-cli FLUSHALL`): cached answers carry no sources, so a cache hit
+CHROMA_PORT=8001 REDIS_HOST=localhost`) or another live instance. `run_eval.py` runs
+with the semantic cache bypassed (`use_cache=False`), so no Redis flush is needed: a cached answer carries no sources and
 would score `context_precision` 0 for reasons unrelated to retrieval (see Known gaps).
 
 ```bash
@@ -443,7 +444,7 @@ production-rag-agent/
 │   │   ├── config.py
 │   │   ├── embeddings.py
 │   │   ├── vectorstore.py
-│   │   ├── llm_client.py
+│   │   ├── llm_client.py      # used by cli.py and the Lambda app
 │   │   ├── secrets.py
 │   │   └── semantic_cache.py
 │   ├── tools/
@@ -473,7 +474,7 @@ production-rag-agent/
 │   ├── cost/
 │   │   ├── pricing.py         # per-model USD/1M-token table
 │   │   ├── tracker.py         # records real usage + hypothetical gpt-4o cost
-│   │   └── report.py          # aggregate report from logs/cost_log.jsonl
+│   │   └── report.py          # summarize() for GET /cost + terminal report from logs/cost_log.jsonl
 │   ├── agents/
 │   │   ├── state.py           # ContentState TypedDict
 │   │   ├── researcher.py      # Chroma retrieval -> plain facts only
@@ -488,6 +489,7 @@ production-rag-agent/
 │   ├── test_sources_footer.py
 │   ├── test_sse.py
 │   ├── test_prompts.py
+│   ├── test_cost_summary.py
 │   └── test_imports.py
 ├── frontend/
 │   └── index.html             # the web UI, served by the API at /
@@ -529,9 +531,10 @@ Everything below is deliberate and written down. Items marked **Fixed** were gap
 
 ### Pipeline and API
 
-- **New: `/chat` is an open, general-purpose model on the owner's key**, with no retrieval and only a short
-  system prompt, and **`/cost` reports only `/chat`'s counters** (not `/ask` or `/ask/stream`; real cost is in `logs/cost_log.jsonl`
-  and `python -m src.cost.report`). Whether to remove `/chat` and point `/cost` at the real cost log is an open decision.
+- **`/chat` was an open, general-purpose model on the owner's key**, with no retrieval and only a short
+  system prompt, and **`/cost` reported only `/chat`'s counters** (not `/ask` or `/ask/stream`).
+  **Fixed**: the FastAPI `/chat` route was removed (`llm_client.py` stays for `cli.py` and the Lambda app), and
+  `/cost` now returns the totals from `logs/cost_log.jsonl`, the same numbers as `python -m src.cost.report`.
 - **New: the sources footer is the model's self-report**, so the chips can vary from run to run (one run listed only the
   warranty file for a question that used both policies). If a pattern appears, the options are to require listing a file if even one
   fact came from it, or to lower the temperature.
@@ -579,8 +582,8 @@ Everything below is deliberate and written down. Items marked **Fixed** were gap
   list of sources from the final structured-output call, not an independently verified ground
   truth — some precision variance between otherwise-similar runs may come from this self-report
   shifting slightly rather than retrieval itself changing.
-- **New: `run_eval.py` runs with the cache on**, so Redis must be flushed before a run (`docker compose exec redis redis-cli FLUSHALL`),
-  or cached answers (which carry no sources) score `context_precision` 0. Setting `use_cache=False` in `run_eval.py` is a pending small fix.
+- **`run_eval.py` ran with the cache on**, so Redis had to be flushed before a run, or cached answers (which carry
+  no sources) scored `context_precision` 0. **Fixed**: `run_eval.py` now builds `RAGPipeline(use_cache=False)`, like `ab_test.py`.
 - **Two mislabeled content bugs found via LangSmith trace inspection, not yet fixed:**
   `product_catalog.txt`'s SummitCarry Backpack entry contains a chunk of tent-specific content
   (DAC poles, rainfly, "tent body" in the included-items list) — almost certainly a copy-paste
@@ -706,7 +709,7 @@ The git tags below trace that progression; check tag history, not just the lates
 | `v1.1-week5-infra` | 5 | Docker Compose, ECS/Fargate via Terraform, semantic caching (Redis), rate limiting, load testing | ✅ |
 | `v1.2-week6-observability` | 6 | LangSmith tracing, context precision/recall, regression + A/B testing harness, fine-tuning dataset (prepared, untrained), Bedrock comparison, cost tracking | ✅ |
 | `v1.3-week7-hardening` | 7 | LangGraph Researcher + Writer pipeline; Kubernetes fundamentals + local Minikube deployment (self-healing demonstrated live); EKS fundamentals (conceptual, deliberately deferred twice); input validation + prompt-injection hardening + key rotation runbook; CloudWatch monitoring + alerting (SNS, metric filters, alarms, dashboard - validated with a real fire drill). Saturday project: orchestrator/specialist router pattern documented (not built, deferred to Week 8) | ✅ |
-| *(untagged)* | after 7 | Web UI redesign served by the API; typed SSE events; one streamed agent loop (a plain question costs 1 model call, not 2); sources footer; pipeline split into modules; generic errors and CORS off by default; 47 tests; README and `infra/README.md` restructure | ✅ |
+| *(untagged)* | after 7 | Web UI redesign served by the API; typed SSE events; one streamed agent loop (a plain question costs 1 model call, not 2); sources footer; pipeline split into modules; generic errors and CORS off by default; open `/chat` route removed, `/cost` reads the real cost log, `run_eval` bypasses the cache; 51 tests; README and `infra/README.md` restructure | ✅ |
 
 <details>
 <summary><strong>Tech stack</strong></summary>
@@ -767,11 +770,11 @@ The git tags below trace that progression; check tag history, not just the lates
 <summary><strong>Architecture as text (the original diagram)</strong></summary>
 
 ```
-                    cli.py                  api/main.py (/chat, /ask, /ask/stream)
+                    cli.py                  api/main.py (/ask, /ask/stream, /cost)
                  (terminal chat)              (FastAPI, rate-limited via slowapi)
                         \                          /
                          \                        /
-                    core/llm_client.py (used by /chat only)
+                    core/llm_client.py (used by cli.py and the Lambda app only; the API's /chat route was removed)
                     core/secrets.py -- Secrets Manager fetch, .env fallback for local dev
                     rag/pipeline.py -- RAGPipeline (use_cache flag)
                                |         |          \

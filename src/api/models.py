@@ -1,24 +1,11 @@
 from pydantic import BaseModel, Field, field_validator
 
-class ChatRequest(BaseModel):
-    message: str = Field(..., min_length=1, max_length=2000)
-
-    @field_validator("message")
-    @classmethod
-    def not_blank(cls, v: str) -> str:
-        v = v.strip()
-        if not v:
-            raise ValueError("message cannot be blank or whitespace-only")
-        return v
-
-class ChatResponse(BaseModel):
-    reply: str
-    total_cost: float
-
-class ChatMetaData(BaseModel):
+class CostSummary(BaseModel):
+    """What GET /cost returns: totals from logs/cost_log.jsonl (every model call the app has made)."""
     total_calls: int
-    total_retries: int
-    total_cost: float
+    total_cost_usd: float
+    cost_if_gpt4o_usd: float
+    by_stage: dict[str, float]
 
 class RagRequest(BaseModel):
     message: str = Field(..., min_length=1, max_length=2000)

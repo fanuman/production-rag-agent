@@ -122,7 +122,7 @@ def containers():
     s.node(105, 215, 150, 96, "end", [("Browser", "t"), ("web UI at /", "d"), ("or curl", "d")])
 
     s.frame(270, 130, 420, 282, "code", "app container: FastAPI + uvicorn")
-    s.node(480, 215, 370, 58, "code", [("API routes + rate limit", "t"), ("/ask/stream  /ask  /chat  /health", "m")])
+    s.node(480, 215, 370, 58, "code", [("API routes + rate limit", "t"), ("/ask/stream  /ask  /cost  /health", "m")])
     s.node(480, 290, 370, 58, "code", [("RAGPipeline", "t"), ("cache, retrieve, agent loop, sources", "d")])
     s.node(480, 365, 370, 58, "code", [("Web UI files", "t"), ("frontend/ served at / (same origin)", "d")])
 
